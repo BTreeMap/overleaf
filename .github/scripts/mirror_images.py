@@ -10,7 +10,6 @@ import json
 import re
 import subprocess
 import sys
-from typing import Optional
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
@@ -174,7 +173,7 @@ def discover_versions(
     return result
 
 
-def get_latest_upstream_version(source_image: str = 'sharelatex/sharelatex') -> Optional[str]:
+def get_latest_upstream_version(source_image: str = 'sharelatex/sharelatex') -> str | None:
     """Get the latest version from upstream Docker registry.
     
     Args:
