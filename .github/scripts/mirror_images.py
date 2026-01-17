@@ -52,7 +52,11 @@ def parse_version_parts(version: str) -> tuple[int, int, int, int | None, int | 
 
 
 def version_sort_key(version: str) -> tuple[int, int, int, int, int]:
-    """Build a stable sort key for base and CEP variant version strings."""
+    """Build a stable sort key for base and CEP variant version strings.
+
+    Missing extension values are represented with -1 so that plain semver tags
+    sort before CEP extension variants with the same base version.
+    """
     major, minor, patch, ext_major, ext_minor = parse_version_parts(version)
     if ext_major is None:
         return (major, minor, patch, -1, -1)
