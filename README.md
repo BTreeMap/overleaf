@@ -13,24 +13,47 @@ Images are published to GitHub Container Registry (GHCR):
 
 ## Image Tags
 
-### Stable (Recommended for Production)
+### Mirrored Images (Recommended for Production)
 
-The **stable** images track upstream [GitHub releases](https://github.com/overleaf/overleaf/releases):
+We mirror pre-built images from various upstream sources with multiple tags for version pinning:
+
+#### Official (from `sharelatex/sharelatex`)
 
 | Tag | Description |
 |-----|-------------|
-| `:latest` | Latest stable release (points to stable, not edge) |
-| `:X.Y.Z` | Specific version (e.g., `:5.1.2`) |
-| `:X.Y` | Minor version (e.g., `:5.1`) |
-| `:X` | Major version (e.g., `:5`) |
-| `:stable-vX.Y.Z` | Explicit stable tag (e.g., `:stable-v5.1.2`) |
-| `:stable-sha-<SHA>` | Immutable tag by upstream commit SHA |
-| `:YYYY-MM-DD` | Date of build |
-| `:YYYY-MM-DD.HH-MM-SS` | Datetime of build |
+| `:official` | Latest official release |
+| `:official-latest` | Same as `:official` |
+| `:official-X.Y.Z` | Specific version (e.g., `:official-5.1.2`) |
+| `:official-X.Y` | Minor version (e.g., `:official-5.1`) |
+| `:official-X` | Major version (e.g., `:official-5`) |
+
+#### Full (from `tuetenk0pp/sharelatex-full`)
+
+Pre-built images with full TeX Live installation:
+
+| Tag | Description |
+|-----|-------------|
+| `:full` | Latest full release |
+| `:full-latest` | Same as `:full` |
+| `:full-X.Y.Z` | Specific version (e.g., `:full-5.1.2`) |
+| `:full-X.Y` | Minor version (e.g., `:full-5.1`) |
+| `:full-X` | Major version (e.g., `:full-5`) |
+
+#### CEP (from `overleafcep/sharelatex`)
+
+Community Extended Pack with additional features:
+
+| Tag | Description |
+|-----|-------------|
+| `:cep` | Latest CEP release |
+| `:cep-latest` | Same as `:cep` |
+| `:cep-X.Y.Z` | Specific version (e.g., `:cep-5.1.2`) |
+| `:cep-X.Y` | Minor version (e.g., `:cep-5.1`) |
+| `:cep-X` | Major version (e.g., `:cep-5`) |
 
 ### Edge (Development/Testing)
 
-The **edge** images track the upstream `main` branch:
+The **edge** images are built from the upstream `main` branch with full TeX Live:
 
 | Tag | Description |
 |-----|-------------|
@@ -57,7 +80,7 @@ All images are built for:
 
 ### Full TeX Live (Air-Gapped Ready)
 
-The `ghcr.io/btreemap/overleaf` runtime images include **TeX Live scheme-full** pre-installed. This means:
+The `ghcr.io/btreemap/overleaf` edge images include **TeX Live scheme-full** pre-installed. This means:
 
 - **Complete LaTeX package availability** - No need to install packages at runtime
 - **Air-gapped operation** - Works fully offline without network access to CTAN mirrors
@@ -71,26 +94,31 @@ The base image (`overleaf-base`) includes TeX Live scheme-basic. The full TeX Li
 |-------|----------|-------------|
 | `overleaf-base` | Weekly (Sunday) | Refreshes base dependencies and TeX Live |
 | `overleaf` (edge) | Daily | Builds from upstream `main` branch |
-| `overleaf` (stable) | Daily + On Release | Builds from upstream releases |
+| `overleaf` (mirrored) | Daily | Mirrors from Docker Hub sources |
 
 Builds are skipped if the image for that upstream SHA already exists (to avoid redundant work).
+
+Mirror sync uses a binary search algorithm to efficiently detect which versions need to be mirrored, minimizing API calls.
 
 ## Usage
 
 ### Quick Start
 
 ```bash
-# Pull the latest stable image
-docker pull ghcr.io/btreemap/overleaf:latest
+# Pull the latest official image (mirrored from sharelatex/sharelatex)
+docker pull ghcr.io/btreemap/overleaf:official
+
+# Or use the full variant with complete TeX Live
+docker pull ghcr.io/btreemap/overleaf:full
 
 # Or use a specific version
-docker pull ghcr.io/btreemap/overleaf:5.1.2
+docker pull ghcr.io/btreemap/overleaf:official-5.1.2
 
 # Run Overleaf
 docker run -d \
   -p 80:80 \
   -v overleaf-data:/var/lib/overleaf \
-  ghcr.io/btreemap/overleaf:latest
+  ghcr.io/btreemap/overleaf:official
 ```
 
 ### Using Edge Images
@@ -106,7 +134,7 @@ docker pull ghcr.io/btreemap/overleaf:edge
 version: '3'
 services:
   overleaf:
-    image: ghcr.io/btreemap/overleaf:latest
+    image: ghcr.io/btreemap/overleaf:official
     ports:
       - "80:80"
     volumes:
@@ -120,11 +148,20 @@ volumes:
 
 ## How It Works
 
-1. **Detect Upstream State**: Workflows query upstream for the latest `main` SHA and release tag
+### Edge Builds
+
+1. **Detect Upstream State**: Workflows query upstream for the latest `main` SHA
 2. **Check GHCR**: Skip builds if images for those SHAs already exist
 3. **Checkout Upstream**: Dynamically checkout `overleaf/overleaf` at the target ref
 4. **Build Images**: Multi-arch builds using Docker Buildx with GHA cache
 5. **Publish**: Push to GHCR with appropriate tags
+
+### Mirrored Images
+
+1. **Discover Versions**: Fetch all semantic version tags from Docker Hub sources
+2. **Binary Search Optimization**: Use binary search to find which versions need mirroring
+3. **Mirror**: Use `docker buildx imagetools create` to copy images without rebuilding
+4. **Multi-Tag**: Apply multiple tags (X.Y.Z, X.Y, X) for version pinning flexibility
 
 ## Upstream
 
