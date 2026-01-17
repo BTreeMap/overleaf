@@ -43,80 +43,65 @@ jobs:
       - name: Detect upstream edge SHA
         id: detect
         run: |
-          python3 << 'EOF'
-          import os
-          import subprocess
-          from datetime import datetime, timezone
-          
           # Get the tip of main branch from upstream
-          result = subprocess.run(
-              ['git', 'ls-remote', 'https://github.com/overleaf/overleaf.git', 'refs/heads/main'],
-              capture_output=True,
-              text=True,
-              timeout=30
-          )
-          edge_sha = result.stdout.split()[0] if result.stdout else ''
-          edge_sha_short = edge_sha[:7]
+          EDGE_SHA=$(git ls-remote https://github.com/overleaf/overleaf.git refs/heads/main | cut -f1)
+          echo "edge_sha=${EDGE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "edge_sha_short=${EDGE_SHA:0:7}" >> "$GITHUB_OUTPUT"
           
           # Generate build timestamps
-          now = datetime.now(timezone.utc)
-          build_date = now.strftime('%Y-%m-%d')
-          build_datetime = now.strftime('%Y-%m-%d.%H-%M-%S')
+          BUILD_DATE=$(date -u '+%Y-%m-%d')
+          BUILD_DATETIME=$(date -u '+%Y-%m-%d.%H-%M-%S')
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          echo "build_datetime=${BUILD_DATETIME}" >> "$GITHUB_OUTPUT"
           
-          # Write outputs
-          github_output = os.environ.get('GITHUB_OUTPUT', '')
-          if github_output:
-              with open(github_output, 'a') as f:
-                  f.write(f"edge_sha={edge_sha}\n")
-                  f.write(f"edge_sha_short={edge_sha_short}\n")
-                  f.write(f"build_date={build_date}\n")
-                  f.write(f"build_datetime={build_datetime}\n")
-          
-          print(f"Detected upstream edge SHA: {edge_sha}")
-          print(f"Build date: {build_date}")
-          print(f"Build datetime: {build_datetime}")
-          EOF
+          echo "Detected upstream edge SHA: ${EDGE_SHA}"
+          echo "Build date: ${BUILD_DATE}"
+          echo "Build datetime: ${BUILD_DATETIME}"
 
       - name: Check if image exists in GHCR
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python3 << 'EOF'
-          import os
-          import subprocess
+          EDGE_SHA="${{ steps.detect.outputs.edge_sha }}"
+          IMAGE_TAG="edge-sha-${EDGE_SHA}"
           
-          edge_sha = "${{ steps.detect.outputs.edge_sha }}"
-          image_tag = f"edge-sha-{edge_sha}"
-          is_scheduled = "${{ github.event_name }}" == "schedule"
-          force_rebuild = "${{ inputs.force_rebuild || 'false' }}" == "true"
+          # Check if this is a weekly scheduled run or forced rebuild
+          IS_SCHEDULED="${{ github.event_name == 'schedule' }}"
+          FORCE_REBUILD="${{ inputs.force_rebuild || 'false' }}"
           
           # For weekly builds, always rebuild
-          if is_scheduled:
-              print("Weekly scheduled build - forcing rebuild")
-              should_build = "true"
-          elif force_rebuild:
-              print("Force rebuild requested")
-              should_build = "true"
-          else:
-              # Check if image already exists
-              result = subprocess.run(
-                  ['docker', 'buildx', 'imagetools', 'inspect', f'ghcr.io/btreemap/overleaf-base:{image_tag}'],
-                  capture_output=True,
-                  timeout=60
-              )
-              if result.returncode == 0:
-                  print(f"Image with tag {image_tag} already exists, skipping build")
-                  should_build = "false"
-              else:
-                  print(f"Image tag {image_tag} not found, will build")
-                  should_build = "true"
+          if [[ "$IS_SCHEDULED" == "true" ]]; then
+            echo "Weekly scheduled build - forcing rebuild"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           
-          github_output = os.environ.get('GITHUB_OUTPUT', '')
-          if github_output:
-              with open(github_output, 'a') as f:
-                  f.write(f"should_build={should_build}\n")
-          EOF
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            echo "Force rebuild requested"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Check if image already exists using GitHub API
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/btreemap/packages/container/overleaf-base/versions" 2>/dev/null || echo "000")
+          
+          if [[ "$HTTP_STATUS" == "200" ]]; then
+            # Package exists, check for specific tag using docker buildx
+            if docker buildx imagetools inspect "ghcr.io/btreemap/overleaf-base:${IMAGE_TAG}" > /dev/null 2>&1; then
+              echo "Image with tag ${IMAGE_TAG} already exists, skipping build"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Image tag ${IMAGE_TAG} not found, will build"
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Package not found or error checking (HTTP ${HTTP_STATUS}), will build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     name: Build ${{ matrix.platform }}
@@ -178,19 +163,10 @@ jobs:
 
       - name: Export digest
         run: |
-          python3 << 'EOF'
-          import os
-          
-          digest = "${{ steps.build.outputs.digest }}"
-          os.makedirs('/tmp/digests', exist_ok=True)
-          digest_file = digest.replace('sha256:', '')
-          open(f'/tmp/digests/{digest_file}', 'w').close()
-          
-          github_output = os.environ.get('GITHUB_OUTPUT', '')
-          if github_output:
-              with open(github_output, 'a') as f:
-                  f.write(f"digest-${{ matrix.arch }}={digest}\n")
-          EOF
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+          echo "digest-${{ matrix.arch }}=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -239,34 +215,11 @@ jobs:
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          python3 << 'EOF'
-          import json
-          import os
-          import subprocess
-          
-          metadata_json = os.environ.get('DOCKER_METADATA_OUTPUT_JSON', '{}')
-          metadata = json.loads(metadata_json)
-          
-          tags = metadata.get('tags', [])
-          tag_args = []
-          for tag in tags:
-              tag_args.extend(['-t', tag])
-          
-          # Get all digest files
-          digests = []
-          for f in os.listdir('.'):
-              digests.append(f'ghcr.io/${{ env.BASE_IMAGE_NAME }}@sha256:{f}')
-          
-          cmd = ['docker', 'buildx', 'imagetools', 'create'] + tag_args + digests
-          subprocess.run(cmd, check=True)
-          EOF
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGESTS=$(printf '${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}@sha256:%s ' *)
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $TAGS $DIGESTS
 
       - name: Inspect image
         run: |
-          python3 << 'EOF'
-          import subprocess
-          subprocess.run(
-              ['docker', 'buildx', 'imagetools', 'inspect', 'ghcr.io/${{ env.BASE_IMAGE_NAME }}:edge'],
-              check=True
-          )
-          EOF
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:edge"

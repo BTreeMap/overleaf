@@ -72,141 +72,11 @@ jobs:
           FORCE_FULL_SYNC: ${{ inputs.force_full_sync || 'false' }}
           VARIANT_FILTER: ${{ inputs.variant || 'all' }}
         run: |
-          python3 << 'EOF'
-          import json
-          import os
-          import re
-          import subprocess
-          import sys
-          from urllib.request import urlopen
-          from urllib.error import URLError, HTTPError
-          
-          
-          def get_dockerhub_tags(image: str) -> list[str]:
-              """Fetch all semver tags from Docker Hub."""
-              page = 1
-              all_tags: list[str] = []
-              semver_pattern = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+$')
-              
-              while True:
-                  url = f"https://hub.docker.com/v2/repositories/{image}/tags?page={page}&page_size=100"
-                  try:
-                      with urlopen(url, timeout=30) as response:
-                          data = json.loads(response.read().decode())
-                  except (URLError, HTTPError, json.JSONDecodeError):
-                      break
-                      
-                  results = data.get('results', [])
-                  if not results:
-                      break
-                      
-                  for tag_info in results:
-                      tag = tag_info.get('name', '')
-                      if semver_pattern.match(tag):
-                          all_tags.append(tag)
-                          
-                  if data.get('next') is None:
-                      break
-                      
-                  page += 1
-              
-              return sorted(set(all_tags), key=lambda v: [int(x) for x in v.split('.')])
-          
-          
-          def check_ghcr_tag_exists(image: str, tag: str) -> bool:
-              """Check if a tag exists in GHCR."""
-              result = subprocess.run(
-                  ['docker', 'buildx', 'imagetools', 'inspect', f'ghcr.io/{image}:{tag}'],
-                  capture_output=True,
-                  timeout=60
-              )
-              return result.returncode == 0
-          
-          
-          def filter_versions_binary_search(
-              versions: list[str], 
-              variant: str, 
-              image: str,
-              force_full_sync: bool = False
-          ) -> list[str]:
-              """Filter versions using binary search optimization."""
-              if not versions:
-                  return []
-                  
-              if force_full_sync:
-                  return versions
-              
-              count = len(versions)
-              left, right = 0, count - 1
-              first_missing = count
-              
-              while left <= right:
-                  mid = (left + right) // 2
-                  tag = f"{variant}-{versions[mid]}"
-                  
-                  if check_ghcr_tag_exists(image, tag):
-                      left = mid + 1
-                  else:
-                      first_missing = mid
-                      right = mid - 1
-              
-              seen: set[str] = set()
-              result: list[str] = []
-              
-              for i in range(first_missing, count):
-                  version = versions[i]
-                  if version not in seen:
-                      result.append(version)
-                      seen.add(version)
-              
-              check_start = max(0, first_missing - 5)
-              for i in range(check_start, first_missing):
-                  version = versions[i]
-                  tag = f"{variant}-{version}"
-                  if version not in seen and not check_ghcr_tag_exists(image, tag):
-                      result.append(version)
-                      seen.add(version)
-              
-              return sorted(result, key=lambda v: [int(x) for x in v.split('.')])
-          
-          
-          # Main logic
-          force_full_sync = os.environ.get('FORCE_FULL_SYNC', 'false').lower() == 'true'
-          variant_filter = os.environ.get('VARIANT_FILTER', 'all')
-          image = 'btreemap/overleaf'
-          
-          variants = {
-              'official': 'sharelatex/sharelatex',
-              'full': 'tuetenk0pp/sharelatex-full',
-              'cep': 'overleafcep/sharelatex'
-          }
-          
-          results = {}
-          for variant, source_image in variants.items():
-              if variant_filter not in ('all', variant):
-                  results[variant] = []
-                  continue
-                  
-              print(f"Fetching tags from {source_image}...", file=sys.stderr)
-              all_versions = get_dockerhub_tags(source_image)
-              
-              filtered = filter_versions_binary_search(
-                  all_versions, variant, image, force_full_sync
-              )
-              results[variant] = filtered
-              print(f"{variant.capitalize()} versions to mirror: {len(filtered)}", file=sys.stderr)
-          
-          # Write outputs
-          github_output = os.environ.get('GITHUB_OUTPUT', '')
-          if github_output:
-              with open(github_output, 'a') as f:
-                  for variant, versions in results.items():
-                      f.write(f"{variant}_versions={json.dumps(versions)}\n")
-          
-          print("Discovery complete!")
-          for variant, versions in results.items():
-              print(f"{variant.capitalize()}: {json.dumps(versions)}")
-          EOF
+          ARGS="--output-format github --image ${{ env.IMAGE_NAME }}"
+          [[ "$FORCE_FULL_SYNC" == "true" ]] && ARGS="$ARGS --force-full-sync"
+          [[ "$VARIANT_FILTER" != "all" ]] && ARGS="$ARGS --variant $VARIANT_FILTER"
+          # shellcheck disable=SC2086
+          python3 .github/scripts/mirror_images.py discover $ARGS
 
   mirror-official:
     name: Mirror Official ${{ matrix.version }}
@@ -219,6 +89,9 @@ jobs:
       matrix:
         version: ${{ fromJson(needs.discover-versions.outputs.official_versions) }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -230,64 +103,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Mirror image with multiple tags
-        env:
-          VERSION: ${{ matrix.version }}
         run: |
-          python3 << 'EOF'
-          import os
-          import subprocess
-          import sys
-          
-          version = os.environ['VERSION']
-          parts = version.split('.')
-          major = parts[0]
-          major_minor = f"{parts[0]}.{parts[1]}"
-          
-          source = f"docker.io/sharelatex/sharelatex:{version}"
-          dest = "ghcr.io/${{ env.IMAGE_NAME }}"
-          placeholder = "${{ env.PLACEHOLDER_IMAGE }}"
-          
-          print(f"Mirroring {source} to {dest}...")
-          
-          # Try to mirror the image
-          result = subprocess.run(
-              [
-                  'docker', 'buildx', 'imagetools', 'create',
-                  '-t', f"{dest}:official-{version}",
-                  '-t', f"{dest}:official-{major_minor}",
-                  '-t', f"{dest}:official-{major}",
-                  source
-              ],
-              capture_output=True,
-              text=True
-          )
-          
-          if result.returncode != 0:
-              # Check for schema1 manifest error
-              if 'schema1' in result.stderr.lower() or 'schema1' in result.stdout.lower():
-                  print(f"Schema1 manifest detected for {version}, using placeholder image")
-                  # Use placeholder image instead
-                  result = subprocess.run(
-                      [
-                          'docker', 'buildx', 'imagetools', 'create',
-                          '-t', f"{dest}:official-{version}",
-                          '-t', f"{dest}:official-{major_minor}",
-                          '-t', f"{dest}:official-{major}",
-                          placeholder
-                      ],
-                      capture_output=True,
-                      text=True
-                  )
-                  if result.returncode != 0:
-                      print(f"Error: {result.stderr}", file=sys.stderr)
-                      sys.exit(1)
-                  print(f"Successfully created placeholder for official:{version}")
-              else:
-                  print(f"Error: {result.stderr}", file=sys.stderr)
-                  sys.exit(1)
-          else:
-              print(f"Successfully mirrored official:{version}")
-          EOF
+          python3 .github/scripts/mirror_images.py mirror \
+            --source sharelatex/sharelatex \
+            --dest "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" \
+            --version "${{ matrix.version }}" \
+            --variant official \
+            --placeholder "${{ env.PLACEHOLDER_IMAGE }}"
 
   mirror-full:
     name: Mirror Full ${{ matrix.version }}
@@ -300,6 +122,9 @@ jobs:
       matrix:
         version: ${{ fromJson(needs.discover-versions.outputs.full_versions) }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -311,61 +136,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Mirror image with multiple tags
-        env:
-          VERSION: ${{ matrix.version }}
         run: |
-          python3 << 'EOF'
-          import os
-          import subprocess
-          import sys
-          
-          version = os.environ['VERSION']
-          parts = version.split('.')
-          major = parts[0]
-          major_minor = f"{parts[0]}.{parts[1]}"
-          
-          source = f"docker.io/tuetenk0pp/sharelatex-full:{version}"
-          dest = "ghcr.io/${{ env.IMAGE_NAME }}"
-          placeholder = "${{ env.PLACEHOLDER_IMAGE }}"
-          
-          print(f"Mirroring {source} to {dest}...")
-          
-          result = subprocess.run(
-              [
-                  'docker', 'buildx', 'imagetools', 'create',
-                  '-t', f"{dest}:full-{version}",
-                  '-t', f"{dest}:full-{major_minor}",
-                  '-t', f"{dest}:full-{major}",
-                  source
-              ],
-              capture_output=True,
-              text=True
-          )
-          
-          if result.returncode != 0:
-              if 'schema1' in result.stderr.lower() or 'schema1' in result.stdout.lower():
-                  print(f"Schema1 manifest detected for {version}, using placeholder image")
-                  result = subprocess.run(
-                      [
-                          'docker', 'buildx', 'imagetools', 'create',
-                          '-t', f"{dest}:full-{version}",
-                          '-t', f"{dest}:full-{major_minor}",
-                          '-t', f"{dest}:full-{major}",
-                          placeholder
-                      ],
-                      capture_output=True,
-                      text=True
-                  )
-                  if result.returncode != 0:
-                      print(f"Error: {result.stderr}", file=sys.stderr)
-                      sys.exit(1)
-                  print(f"Successfully created placeholder for full:{version}")
-              else:
-                  print(f"Error: {result.stderr}", file=sys.stderr)
-                  sys.exit(1)
-          else:
-              print(f"Successfully mirrored full:{version}")
-          EOF
+          python3 .github/scripts/mirror_images.py mirror \
+            --source tuetenk0pp/sharelatex-full \
+            --dest "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" \
+            --version "${{ matrix.version }}" \
+            --variant full \
+            --placeholder "${{ env.PLACEHOLDER_IMAGE }}"
 
   mirror-cep:
     name: Mirror CEP ${{ matrix.version }}
@@ -378,6 +155,9 @@ jobs:
       matrix:
         version: ${{ fromJson(needs.discover-versions.outputs.cep_versions) }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -389,61 +169,13 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Mirror image with multiple tags
-        env:
-          VERSION: ${{ matrix.version }}
         run: |
-          python3 << 'EOF'
-          import os
-          import subprocess
-          import sys
-          
-          version = os.environ['VERSION']
-          parts = version.split('.')
-          major = parts[0]
-          major_minor = f"{parts[0]}.{parts[1]}"
-          
-          source = f"docker.io/overleafcep/sharelatex:{version}"
-          dest = "ghcr.io/${{ env.IMAGE_NAME }}"
-          placeholder = "${{ env.PLACEHOLDER_IMAGE }}"
-          
-          print(f"Mirroring {source} to {dest}...")
-          
-          result = subprocess.run(
-              [
-                  'docker', 'buildx', 'imagetools', 'create',
-                  '-t', f"{dest}:cep-{version}",
-                  '-t', f"{dest}:cep-{major_minor}",
-                  '-t', f"{dest}:cep-{major}",
-                  source
-              ],
-              capture_output=True,
-              text=True
-          )
-          
-          if result.returncode != 0:
-              if 'schema1' in result.stderr.lower() or 'schema1' in result.stdout.lower():
-                  print(f"Schema1 manifest detected for {version}, using placeholder image")
-                  result = subprocess.run(
-                      [
-                          'docker', 'buildx', 'imagetools', 'create',
-                          '-t', f"{dest}:cep-{version}",
-                          '-t', f"{dest}:cep-{major_minor}",
-                          '-t', f"{dest}:cep-{major}",
-                          placeholder
-                      ],
-                      capture_output=True,
-                      text=True
-                  )
-                  if result.returncode != 0:
-                      print(f"Error: {result.stderr}", file=sys.stderr)
-                      sys.exit(1)
-                  print(f"Successfully created placeholder for cep:{version}")
-              else:
-                  print(f"Error: {result.stderr}", file=sys.stderr)
-                  sys.exit(1)
-          else:
-              print(f"Successfully mirrored cep:{version}")
-          EOF
+          python3 .github/scripts/mirror_images.py mirror \
+            --source overleafcep/sharelatex \
+            --dest "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" \
+            --version "${{ matrix.version }}" \
+            --variant cep \
+            --placeholder "${{ env.PLACEHOLDER_IMAGE }}"
 
   update-latest-tags:
     name: Update Latest Tags
@@ -451,6 +183,9 @@ jobs:
     if: always() && (needs.mirror-official.result == 'success' || needs.mirror-full.result == 'success' || needs.mirror-cep.result == 'success' || needs.mirror-official.result == 'skipped' || needs.mirror-full.result == 'skipped' || needs.mirror-cep.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -465,71 +200,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python3 << 'EOF'
-          import json
-          import os
-          import re
-          import subprocess
-          import sys
-          from urllib.request import urlopen, Request
-          from urllib.error import URLError, HTTPError
-          
-          dest = "ghcr.io/${{ env.IMAGE_NAME }}"
-          image_name = "${{ env.IMAGE_NAME }}"
-          token = os.environ.get('GH_TOKEN', '')
-          
-          def find_latest_existing_tag(variant: str) -> str | None:
-              """Find the latest version tag that exists in GHCR."""
-              try:
-                  req = Request(
-                      f"https://ghcr.io/v2/{image_name}/tags/list",
-                      headers={'Authorization': f'Bearer {token}'}
-                  )
-                  with urlopen(req, timeout=30) as response:
-                      data = json.loads(response.read().decode())
-                      tags = data.get('tags', [])
-              except (URLError, HTTPError, json.JSONDecodeError):
-                  return None
-              
-              if not tags:
-                  return None
-              
-              # Filter and find latest version
-              semver_pattern = re.compile(rf'^{variant}-([0-9]+\.[0-9]+\.[0-9]+)$')
-              versions = []
-              for tag in tags:
-                  match = semver_pattern.match(tag)
-                  if match:
-                      versions.append(match.group(1))
-              
-              if not versions:
-                  return None
-              
-              return sorted(versions, key=lambda v: [int(x) for x in v.split('.')])[-1]
-          
-          def update_latest_tag(variant: str, latest_version: str):
-              """Update the latest tag for a variant."""
-              print(f"Updating {variant}-latest to point to {variant}-{latest_version}")
-              result = subprocess.run(
-                  [
-                      'docker', 'buildx', 'imagetools', 'create',
-                      '-t', f"{dest}:{variant}-latest",
-                      '-t', f"{dest}:{variant}",
-                      f"{dest}:{variant}-{latest_version}"
-                  ],
-                  capture_output=True,
-                  text=True
-              )
-              if result.returncode != 0:
-                  print(f"Warning: Could not update {variant}-latest: {result.stderr}")
-          
-          # Update each variant
-          for variant in ['official', 'full', 'cep']:
-              latest = find_latest_existing_tag(variant)
-              if latest:
-                  update_latest_tag(variant, latest)
-              else:
-                  print(f"No versions found for {variant}")
-          
-          print("Latest tags updated successfully!")
-          EOF
+          python3 .github/scripts/mirror_images.py update-latest --image "${{ env.IMAGE_NAME }}"

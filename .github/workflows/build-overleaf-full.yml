@@ -15,6 +15,7 @@ on:
       - main
     paths:
       - '.github/workflows/build-overleaf-full.yml'
+      - '.github/scripts/mirror_images.py'
   workflow_dispatch:
     inputs:
       force_rebuild:
@@ -45,108 +46,44 @@ jobs:
       build_date: ${{ steps.detect.outputs.build_date }}
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Detect latest upstream version
         id: detect
         run: |
-          python3 << 'EOF'
-          import json
-          import os
-          import re
-          from datetime import datetime, timezone
-          from urllib.request import urlopen
-          from urllib.error import URLError, HTTPError
+          BUILD_DATE=$(date -u '+%Y-%m-%d')
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
           
-          def get_latest_version() -> str | None:
-              """Fetch the latest semver version from sharelatex/sharelatex."""
-              page = 1
-              all_tags: list[str] = []
-              semver_pattern = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+$')
-              
-              while True:
-                  url = f"https://hub.docker.com/v2/repositories/sharelatex/sharelatex/tags?page={page}&page_size=100"
-                  try:
-                      with urlopen(url, timeout=30) as response:
-                          data = json.loads(response.read().decode())
-                  except (URLError, HTTPError, json.JSONDecodeError):
-                      break
-                      
-                  results = data.get('results', [])
-                  if not results:
-                      break
-                      
-                  for tag_info in results:
-                      tag = tag_info.get('name', '')
-                      if semver_pattern.match(tag):
-                          all_tags.append(tag)
-                          
-                  if data.get('next') is None:
-                      break
-                      
-                  page += 1
-              
-              if not all_tags:
-                  return None
-              
-              sorted_tags = sorted(set(all_tags), key=lambda v: [int(x) for x in v.split('.')])
-              return sorted_tags[-1]
+          OVERRIDE_VERSION="${{ inputs.base_version }}"
+          if [[ -n "$OVERRIDE_VERSION" ]]; then
+            echo "version=${OVERRIDE_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Using override version: ${OVERRIDE_VERSION}"
+          else
+            VERSION=$(python3 .github/scripts/mirror_images.py latest --source sharelatex/sharelatex)
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Detected version: ${VERSION}"
+          fi
           
-          # Get version
-          override_version = "${{ inputs.base_version }}"
-          if override_version:
-              version = override_version
-          else:
-              version = get_latest_version()
-              if not version:
-                  print("Error: Could not detect latest version")
-                  exit(1)
-          
-          # Generate build date
-          build_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-          
-          # Write outputs
-          github_output = os.environ.get('GITHUB_OUTPUT', '')
-          if github_output:
-              with open(github_output, 'a') as f:
-                  f.write(f"version={version}\n")
-                  f.write(f"build_date={build_date}\n")
-          
-          print(f"Detected version: {version}")
-          print(f"Build date: {build_date}")
-          EOF
+          echo "Build date: ${BUILD_DATE}"
 
       - name: Check if today's image exists
         id: check
         run: |
-          python3 << 'EOF'
-          import os
-          import subprocess
+          BUILD_DATE="${{ steps.detect.outputs.build_date }}"
+          FORCE_REBUILD="${{ inputs.force_rebuild || 'false' }}"
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}"
           
-          build_date = "${{ steps.detect.outputs.build_date }}"
-          force_rebuild = "${{ inputs.force_rebuild }}" == "true"
-          image = "ghcr.io/${{ env.IMAGE_NAME }}"
-          
-          if force_rebuild:
-              print("Force rebuild requested")
-              should_build = "true"
-          else:
-              # Check if today's build already exists
-              result = subprocess.run(
-                  ['docker', 'buildx', 'imagetools', 'inspect', f'{image}:{build_date}'],
-                  capture_output=True,
-                  timeout=60
-              )
-              if result.returncode == 0:
-                  print(f"Image for {build_date} already exists, skipping build")
-                  should_build = "false"
-              else:
-                  print(f"Image for {build_date} not found, will build")
-                  should_build = "true"
-          
-          github_output = os.environ.get('GITHUB_OUTPUT', '')
-          if github_output:
-              with open(github_output, 'a') as f:
-                  f.write(f"should_build={should_build}\n")
-          EOF
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            echo "Force rebuild requested"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "${IMAGE}:${BUILD_DATE}" > /dev/null 2>&1; then
+            echo "Image for ${BUILD_DATE} already exists, skipping build"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image for ${BUILD_DATE} not found, will build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     name: Build Full Image (${{ matrix.arch }})
@@ -256,14 +193,9 @@ jobs:
 
       - name: Export digest
         run: |
-          python3 << 'EOF'
-          import os
-          
-          digest = "${{ steps.build.outputs.digest }}"
-          os.makedirs('/tmp/digests', exist_ok=True)
-          digest_file = digest.replace('sha256:', '')
-          open(f'/tmp/digests/{digest_file}', 'w').close()
-          EOF
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -311,34 +243,11 @@ jobs:
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          python3 << 'EOF'
-          import json
-          import os
-          import subprocess
-          
-          metadata_json = os.environ.get('DOCKER_METADATA_OUTPUT_JSON', '{}')
-          metadata = json.loads(metadata_json)
-          
-          tags = metadata.get('tags', [])
-          tag_args = []
-          for tag in tags:
-              tag_args.extend(['-t', tag])
-          
-          # Get all digest files
-          digests = []
-          for f in os.listdir('.'):
-              digests.append(f'ghcr.io/${{ env.IMAGE_NAME }}@sha256:{f}')
-          
-          cmd = ['docker', 'buildx', 'imagetools', 'create'] + tag_args + digests
-          subprocess.run(cmd, check=True)
-          EOF
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGESTS=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $TAGS $DIGESTS
 
       - name: Inspect image
         run: |
-          python3 << 'EOF'
-          import subprocess
-          subprocess.run(
-              ['docker', 'buildx', 'imagetools', 'inspect', 'ghcr.io/${{ env.IMAGE_NAME }}:latest'],
-              check=True
-          )
-          EOF
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
