@@ -1,6 +1,18 @@
-# docker image build
-.dockerignore
+# Build artifacts
+/upstream/
+/tmp/
 
-# user defined files
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
 .env
-docker-compose.override.yml
+.env.local
