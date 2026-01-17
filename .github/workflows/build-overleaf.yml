@@ -46,48 +46,75 @@ jobs:
       - name: Detect upstream state
         id: detect
         run: |
+          python3 << 'EOF'
+          import os
+          import subprocess
+          from datetime import datetime, timezone
+          
           # Get the tip of main branch from upstream (EDGE)
-          EDGE_SHA=$(git ls-remote https://github.com/overleaf/overleaf.git refs/heads/main | cut -f1)
-          echo "edge_sha=${EDGE_SHA}" >> "$GITHUB_OUTPUT"
-          echo "edge_sha_short=${EDGE_SHA:0:7}" >> "$GITHUB_OUTPUT"
-          echo "Detected upstream edge SHA: ${EDGE_SHA}"
+          result = subprocess.run(
+              ['git', 'ls-remote', 'https://github.com/overleaf/overleaf.git', 'refs/heads/main'],
+              capture_output=True,
+              text=True,
+              timeout=30
+          )
+          edge_sha = result.stdout.split()[0] if result.stdout else ''
+          edge_sha_short = edge_sha[:7]
           
           # Generate build timestamps
-          BUILD_DATE=$(date -u '+%Y-%m-%d')
-          BUILD_DATETIME=$(date -u '+%Y-%m-%d.%H-%M-%S')
-          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
-          echo "build_datetime=${BUILD_DATETIME}" >> "$GITHUB_OUTPUT"
-          echo "Build date: ${BUILD_DATE}"
-          echo "Build datetime: ${BUILD_DATETIME}"
+          now = datetime.now(timezone.utc)
+          build_date = now.strftime('%Y-%m-%d')
+          build_datetime = now.strftime('%Y-%m-%d.%H-%M-%S')
+          
+          # Write outputs
+          github_output = os.environ.get('GITHUB_OUTPUT', '')
+          if github_output:
+              with open(github_output, 'a') as f:
+                  f.write(f"edge_sha={edge_sha}\n")
+                  f.write(f"edge_sha_short={edge_sha_short}\n")
+                  f.write(f"build_date={build_date}\n")
+                  f.write(f"build_datetime={build_datetime}\n")
+          
+          print(f"Detected upstream edge SHA: {edge_sha}")
+          print(f"Build date: {build_date}")
+          print(f"Build datetime: {build_datetime}")
+          EOF
 
       - name: Check if images exist in GHCR
         id: check
         run: |
-          EDGE_SHA="${{ steps.detect.outputs.edge_sha }}"
+          python3 << 'EOF'
+          import os
+          import subprocess
           
-          FORCE_REBUILD="${{ inputs.force_rebuild || 'false' }}"
+          edge_sha = "${{ steps.detect.outputs.edge_sha }}"
+          force_rebuild = "${{ inputs.force_rebuild || 'false' }}" == "true"
+          image = "ghcr.io/${{ env.IMAGE_NAME }}"
           
-          check_image_exists() {
-            local tag="$1"
-            if docker buildx imagetools inspect "ghcr.io/${{ env.IMAGE_NAME }}:${tag}" > /dev/null 2>&1; then
-              return 0  # exists
-            else
-              return 1  # does not exist
-            fi
-          }
+          def check_image_exists(tag: str) -> bool:
+              result = subprocess.run(
+                  ['docker', 'buildx', 'imagetools', 'inspect', f'{image}:{tag}'],
+                  capture_output=True,
+                  timeout=60
+              )
+              return result.returncode == 0
           
           # Determine if we should build edge
-          SHOULD_BUILD_EDGE="false"
-          if [[ "$FORCE_REBUILD" == "true" ]]; then
-            SHOULD_BUILD_EDGE="true"
-            echo "Force rebuild requested for edge"
-          elif ! check_image_exists "edge-sha-${EDGE_SHA}"; then
-            SHOULD_BUILD_EDGE="true"
-            echo "Edge image not found, will build"
-          else
-            echo "Edge image already exists for SHA ${EDGE_SHA}, skipping"
-          fi
-          echo "should_build_edge=${SHOULD_BUILD_EDGE}" >> "$GITHUB_OUTPUT"
+          if force_rebuild:
+              print("Force rebuild requested for edge")
+              should_build_edge = "true"
+          elif not check_image_exists(f"edge-sha-{edge_sha}"):
+              print("Edge image not found, will build")
+              should_build_edge = "true"
+          else:
+              print(f"Edge image already exists for SHA {edge_sha}, skipping")
+              should_build_edge = "false"
+          
+          github_output = os.environ.get('GITHUB_OUTPUT', '')
+          if github_output:
+              with open(github_output, 'a') as f:
+                  f.write(f"should_build_edge={should_build_edge}\n")
+          EOF
 
   # ===========================================
   # EDGE BUILD
@@ -268,9 +295,14 @@ jobs:
 
       - name: Export digest
         run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          python3 << 'EOF'
+          import os
+          
+          digest = "${{ steps.build.outputs.digest }}"
+          os.makedirs('/tmp/digests', exist_ok=True)
+          digest_file = digest.replace('sha256:', '')
+          open(f'/tmp/digests/{digest_file}', 'w').close()
+          EOF
 
       - name: Upload digest
         uses: actions/upload-artifact@v4
@@ -318,11 +350,34 @@ jobs:
       - name: Create manifest list and push
         working-directory: /tmp/digests
         run: |
-          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
-          DIGESTS=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
-          # shellcheck disable=SC2086
-          docker buildx imagetools create $TAGS $DIGESTS
+          python3 << 'EOF'
+          import json
+          import os
+          import subprocess
+          
+          metadata_json = os.environ.get('DOCKER_METADATA_OUTPUT_JSON', '{}')
+          metadata = json.loads(metadata_json)
+          
+          tags = metadata.get('tags', [])
+          tag_args = []
+          for tag in tags:
+              tag_args.extend(['-t', tag])
+          
+          # Get all digest files
+          digests = []
+          for f in os.listdir('.'):
+              digests.append(f'ghcr.io/${{ env.IMAGE_NAME }}@sha256:{f}')
+          
+          cmd = ['docker', 'buildx', 'imagetools', 'create'] + tag_args + digests
+          subprocess.run(cmd, check=True)
+          EOF
 
       - name: Inspect image
         run: |
-          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge"
+          python3 << 'EOF'
+          import subprocess
+          subprocess.run(
+              ['docker', 'buildx', 'imagetools', 'inspect', 'ghcr.io/${{ env.IMAGE_NAME }}:edge'],
+              check=True
+          )
+          EOF

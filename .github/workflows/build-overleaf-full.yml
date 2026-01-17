@@ -1,0 +1,344 @@
+# Build our own "full" Overleaf image with TeX Live scheme-full
+# Daily scheduled build that fetches the latest version from upstream
+# and creates an optimized image with minimal layers
+#
+# Tags: latest, yyyy-mm-dd
+
+name: Build Overleaf Full Image
+
+on:
+  schedule:
+    # Daily at 04:00 UTC (after mirroring workflow)
+    - cron: '0 4 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-overleaf-full.yml'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even if image exists for today'
+        required: false
+        default: 'false'
+        type: boolean
+      base_version:
+        description: 'Override base image version (leave empty for latest)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: btreemap/overleaf
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-version:
+    name: Detect Latest Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      build_date: ${{ steps.detect.outputs.build_date }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Detect latest upstream version
+        id: detect
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          import re
+          from datetime import datetime, timezone
+          from urllib.request import urlopen
+          from urllib.error import URLError, HTTPError
+          
+          def get_latest_version() -> str | None:
+              """Fetch the latest semver version from sharelatex/sharelatex."""
+              page = 1
+              all_tags: list[str] = []
+              semver_pattern = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+$')
+              
+              while True:
+                  url = f"https://hub.docker.com/v2/repositories/sharelatex/sharelatex/tags?page={page}&page_size=100"
+                  try:
+                      with urlopen(url, timeout=30) as response:
+                          data = json.loads(response.read().decode())
+                  except (URLError, HTTPError, json.JSONDecodeError):
+                      break
+                      
+                  results = data.get('results', [])
+                  if not results:
+                      break
+                      
+                  for tag_info in results:
+                      tag = tag_info.get('name', '')
+                      if semver_pattern.match(tag):
+                          all_tags.append(tag)
+                          
+                  if data.get('next') is None:
+                      break
+                      
+                  page += 1
+              
+              if not all_tags:
+                  return None
+              
+              sorted_tags = sorted(set(all_tags), key=lambda v: [int(x) for x in v.split('.')])
+              return sorted_tags[-1]
+          
+          # Get version
+          override_version = "${{ inputs.base_version }}"
+          if override_version:
+              version = override_version
+          else:
+              version = get_latest_version()
+              if not version:
+                  print("Error: Could not detect latest version")
+                  exit(1)
+          
+          # Generate build date
+          build_date = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+          
+          # Write outputs
+          github_output = os.environ.get('GITHUB_OUTPUT', '')
+          if github_output:
+              with open(github_output, 'a') as f:
+                  f.write(f"version={version}\n")
+                  f.write(f"build_date={build_date}\n")
+          
+          print(f"Detected version: {version}")
+          print(f"Build date: {build_date}")
+          EOF
+
+      - name: Check if today's image exists
+        id: check
+        run: |
+          python3 << 'EOF'
+          import os
+          import subprocess
+          
+          build_date = "${{ steps.detect.outputs.build_date }}"
+          force_rebuild = "${{ inputs.force_rebuild }}" == "true"
+          image = "ghcr.io/${{ env.IMAGE_NAME }}"
+          
+          if force_rebuild:
+              print("Force rebuild requested")
+              should_build = "true"
+          else:
+              # Check if today's build already exists
+              result = subprocess.run(
+                  ['docker', 'buildx', 'imagetools', 'inspect', f'{image}:{build_date}'],
+                  capture_output=True,
+                  timeout=60
+              )
+              if result.returncode == 0:
+                  print(f"Image for {build_date} already exists, skipping build")
+                  should_build = "false"
+              else:
+                  print(f"Image for {build_date} not found, will build")
+                  should_build = "true"
+          
+          github_output = os.environ.get('GITHUB_OUTPUT', '')
+          if github_output:
+              with open(github_output, 'a') as f:
+                  f.write(f"should_build={should_build}\n")
+          EOF
+
+  build:
+    name: Build Full Image (${{ matrix.arch }})
+    needs: detect-version
+    if: needs.detect-version.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Generate optimized Dockerfile
+        run: |
+          cat > Dockerfile << 'DOCKERFILE'
+          # Optimized Overleaf Full Image
+          # Built from upstream sharelatex/sharelatex with full TeX Live and extras
+          # Consolidated commands to minimize layers and image size
+          
+          ARG BASE_VERSION=latest
+          FROM sharelatex/sharelatex:${BASE_VERSION}
+          
+          SHELL ["/bin/bash", "-c"]
+          
+          # Single consolidated RUN command to minimize layers:
+          # 1. Update tlmgr itself
+          # 2. Update texlive-scripts for ctex support
+          # 3. Update all existing packages
+          # 4. Install scheme-full for complete LaTeX packages
+          # 5. Recreate symlinks
+          # 6. Update system packages
+          # 7. Install additional tools (inkscape for SVG, lilypond for music notation)
+          # 8. Enable shell-escape by default
+          # 9. Clean up to reduce image size
+          RUN set -eux; \
+              # Update tlmgr
+              wget -q "https://mirror.ctan.org/systems/texlive/tlnet/update-tlmgr-latest.sh" -O /tmp/update-tlmgr.sh; \
+              sh /tmp/update-tlmgr.sh; \
+              tlmgr --version; \
+              # Update texlive-scripts for ctex support
+              tlmgr update texlive-scripts; \
+              # Update all packages
+              tlmgr update --all; \
+              # Install scheme-full
+              tlmgr install scheme-full; \
+              # Recreate symlinks
+              tlmgr path add; \
+              # Update system packages and install extras
+              apt-get update; \
+              apt-get upgrade -y; \
+              apt-get install -y --no-install-recommends inkscape lilypond; \
+              # Enable shell-escape by default
+              TEXLIVE_FOLDER=$(find /usr/local/texlive/ -maxdepth 1 -type d -name '20*' | head -1); \
+              if [ -n "$TEXLIVE_FOLDER" ]; then \
+                  echo "% enable shell-escape by default" >> "$TEXLIVE_FOLDER/texmf.cnf"; \
+                  echo "shell_escape = t" >> "$TEXLIVE_FOLDER/texmf.cnf"; \
+              fi; \
+              # Clean up to reduce image size
+              apt-get clean; \
+              rm -rf /var/lib/apt/lists/*; \
+              rm -rf /tmp/*; \
+              rm -rf /usr/local/texlive/*/tlpkg/backups/*; \
+              rm -rf /root/.cache/*
+          
+          DOCKERFILE
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=Overleaf Full
+            org.opencontainers.image.description=Overleaf with full TeX Live scheme-full, inkscape, and lilypond
+            org.opencontainers.image.vendor=BTreeMap
+            org.opencontainers.image.version=${{ needs.detect-version.outputs.version }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_VERSION=${{ needs.detect-version.outputs.version }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=overleaf-full-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=overleaf-full-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          python3 << 'EOF'
+          import os
+          
+          digest = "${{ steps.build.outputs.digest }}"
+          os.makedirs('/tmp/digests', exist_ok=True)
+          digest_file = digest.replace('sha256:', '')
+          open(f'/tmp/digests/{digest_file}', 'w').close()
+          EOF
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-full-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create Multi-Arch Manifest
+    needs: [detect-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-full-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Latest tag
+            type=raw,value=latest
+            # Date-based tag
+            type=raw,value=${{ needs.detect-version.outputs.build_date }}
+            # Version-based tag
+            type=raw,value=${{ needs.detect-version.outputs.version }}-full
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          python3 << 'EOF'
+          import json
+          import os
+          import subprocess
+          
+          metadata_json = os.environ.get('DOCKER_METADATA_OUTPUT_JSON', '{}')
+          metadata = json.loads(metadata_json)
+          
+          tags = metadata.get('tags', [])
+          tag_args = []
+          for tag in tags:
+              tag_args.extend(['-t', tag])
+          
+          # Get all digest files
+          digests = []
+          for f in os.listdir('.'):
+              digests.append(f'ghcr.io/${{ env.IMAGE_NAME }}@sha256:{f}')
+          
+          cmd = ['docker', 'buildx', 'imagetools', 'create'] + tag_args + digests
+          subprocess.run(cmd, check=True)
+          EOF
+
+      - name: Inspect image
+        run: |
+          python3 << 'EOF'
+          import subprocess
+          subprocess.run(
+              ['docker', 'buildx', 'imagetools', 'inspect', 'ghcr.io/${{ env.IMAGE_NAME }}:latest'],
+              check=True
+          )
+          EOF
