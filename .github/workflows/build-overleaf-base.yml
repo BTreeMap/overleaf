@@ -118,9 +118,6 @@ jobs:
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
             arch: arm64
-    outputs:
-      digest-amd64: ${{ steps.build.outputs.digest-amd64 }}
-      digest-arm64: ${{ steps.build.outputs.digest-arm64 }}
     steps:
       - name: Checkout upstream overleaf
         uses: actions/checkout@v4
