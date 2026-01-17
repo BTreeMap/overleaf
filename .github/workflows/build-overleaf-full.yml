@@ -1,0 +1,253 @@
+# Build our own "full" Overleaf image with TeX Live scheme-full
+# Daily scheduled build that fetches the latest version from upstream
+# and creates an optimized image with minimal layers
+#
+# Tags: latest, yyyy-mm-dd
+
+name: Build Overleaf Full Image
+
+on:
+  schedule:
+    # Daily at 04:00 UTC (after mirroring workflow)
+    - cron: '0 4 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-overleaf-full.yml'
+      - '.github/scripts/mirror_images.py'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even if image exists for today'
+        required: false
+        default: 'false'
+        type: boolean
+      base_version:
+        description: 'Override base image version (leave empty for latest)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: btreemap/overleaf
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-version:
+    name: Detect Latest Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      build_date: ${{ steps.detect.outputs.build_date }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect latest upstream version
+        id: detect
+        run: |
+          BUILD_DATE=$(date -u '+%Y-%m-%d')
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          
+          OVERRIDE_VERSION="${{ inputs.base_version }}"
+          if [[ -n "$OVERRIDE_VERSION" ]]; then
+            echo "version=${OVERRIDE_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Using override version: ${OVERRIDE_VERSION}"
+          else
+            VERSION=$(python3 .github/scripts/mirror_images.py latest --source sharelatex/sharelatex)
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "Detected version: ${VERSION}"
+          fi
+          
+          echo "Build date: ${BUILD_DATE}"
+
+      - name: Check if today's image exists
+        id: check
+        run: |
+          BUILD_DATE="${{ steps.detect.outputs.build_date }}"
+          FORCE_REBUILD="${{ inputs.force_rebuild || 'false' }}"
+          IMAGE="ghcr.io/${{ env.IMAGE_NAME }}"
+          
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            echo "Force rebuild requested"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "${IMAGE}:${BUILD_DATE}" > /dev/null 2>&1; then
+            echo "Image for ${BUILD_DATE} already exists, skipping build"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Image for ${BUILD_DATE} not found, will build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build Full Image (${{ matrix.arch }})
+    needs: detect-version
+    if: needs.detect-version.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Generate optimized Dockerfile
+        run: |
+          cat > Dockerfile << 'DOCKERFILE'
+          # Optimized Overleaf Full Image
+          # Built from upstream sharelatex/sharelatex with full TeX Live and extras
+          # Consolidated commands to minimize layers and image size
+          
+          ARG BASE_VERSION=latest
+          FROM sharelatex/sharelatex:${BASE_VERSION}
+          
+          SHELL ["/bin/bash", "-c"]
+          
+          # Single consolidated RUN command to minimize layers:
+          # 1. Update tlmgr itself
+          # 2. Update texlive-scripts for ctex support
+          # 3. Update all existing packages
+          # 4. Install scheme-full for complete LaTeX packages
+          # 5. Recreate symlinks
+          # 6. Update system packages
+          # 7. Install additional tools (inkscape for SVG, lilypond for music notation)
+          # 8. Enable shell-escape by default
+          # 9. Clean up to reduce image size
+          RUN set -eux; \
+              # Update tlmgr
+              wget -q "https://mirror.ctan.org/systems/texlive/tlnet/update-tlmgr-latest.sh" -O /tmp/update-tlmgr.sh; \
+              sh /tmp/update-tlmgr.sh; \
+              tlmgr --version; \
+              # Update texlive-scripts for ctex support
+              tlmgr update texlive-scripts; \
+              # Update all packages
+              tlmgr update --all; \
+              # Install scheme-full
+              tlmgr install scheme-full; \
+              # Recreate symlinks
+              tlmgr path add; \
+              # Update system packages and install extras
+              apt-get update; \
+              apt-get upgrade -y; \
+              apt-get install -y --no-install-recommends inkscape lilypond; \
+              # Enable shell-escape by default
+              TEXLIVE_FOLDER=$(find /usr/local/texlive/ -maxdepth 1 -type d -name '20*' | head -1); \
+              if [ -n "$TEXLIVE_FOLDER" ]; then \
+                  echo "% enable shell-escape by default" >> "$TEXLIVE_FOLDER/texmf.cnf"; \
+                  echo "shell_escape = t" >> "$TEXLIVE_FOLDER/texmf.cnf"; \
+              fi; \
+              # Clean up to reduce image size
+              apt-get clean; \
+              rm -rf /var/lib/apt/lists/*; \
+              rm -rf /tmp/*; \
+              rm -rf /usr/local/texlive/*/tlpkg/backups/*; \
+              rm -rf /root/.cache/*
+          
+          DOCKERFILE
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=Overleaf Full
+            org.opencontainers.image.description=Overleaf with full TeX Live scheme-full, inkscape, and lilypond
+            org.opencontainers.image.vendor=BTreeMap
+            org.opencontainers.image.version=${{ needs.detect-version.outputs.version }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BASE_VERSION=${{ needs.detect-version.outputs.version }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=overleaf-full-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=overleaf-full-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-full-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create Multi-Arch Manifest
+    needs: [detect-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-full-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Latest tag
+            type=raw,value=latest
+            # Date-based tag
+            type=raw,value=${{ needs.detect-version.outputs.build_date }}
+            # Version-based tag
+            type=raw,value=${{ needs.detect-version.outputs.version }}-full
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGESTS=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $TAGS $DIGESTS
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"

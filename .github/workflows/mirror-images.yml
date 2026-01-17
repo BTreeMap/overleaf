@@ -6,6 +6,9 @@
 #   - sharelatex/sharelatex -> ghcr.io/btreemap/overleaf:official-*
 #   - tuetenk0pp/sharelatex-full -> ghcr.io/btreemap/overleaf:full-*
 #   - overleafcep/sharelatex -> ghcr.io/btreemap/overleaf:cep-*
+#
+# Note: For older Docker images with schema1 manifest format (not supported by
+# modern Docker toolchains), we use a placeholder image instead.
 
 name: Mirror Docker Images
 
@@ -18,6 +21,7 @@ on:
       - main
     paths:
       - '.github/workflows/mirror-images.yml'
+      - '.github/scripts/mirror_images.py'
   workflow_dispatch:
     inputs:
       force_full_sync:
@@ -39,6 +43,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: btreemap/overleaf
+  PLACEHOLDER_IMAGE: ghcr.io/btreemap/dockerfiles:placeholder
 
 permissions:
   contents: read
@@ -53,188 +58,25 @@ jobs:
       full_versions: ${{ steps.discover.outputs.full_versions }}
       cep_versions: ${{ steps.discover.outputs.cep_versions }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Discover versions to mirror
         id: discover
         env:
           FORCE_FULL_SYNC: ${{ inputs.force_full_sync || 'false' }}
           VARIANT_FILTER: ${{ inputs.variant || 'all' }}
         run: |
-          # Function to get all tags from Docker Hub for a given image
-          get_dockerhub_tags() {
-            local image="$1"
-            local page=1
-            local all_tags=""
-            
-            while true; do
-              local response
-              response=$(curl -sL "https://hub.docker.com/v2/repositories/${image}/tags?page=${page}&page_size=100" 2>/dev/null)
-              
-              if [[ -z "$response" ]] || [[ "$(echo "$response" | jq -r '.results')" == "null" ]]; then
-                break
-              fi
-              
-              local tags
-              tags=$(echo "$response" | jq -r '.results[].name' 2>/dev/null)
-              
-              if [[ -z "$tags" ]]; then
-                break
-              fi
-              
-              all_tags="${all_tags}${tags}"$'\n'
-              
-              # Check if there's a next page
-              local next
-              next=$(echo "$response" | jq -r '.next')
-              if [[ "$next" == "null" ]]; then
-                break
-              fi
-              
-              page=$((page + 1))
-            done
-            
-            echo "$all_tags" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | uniq
-          }
-          
-          # Function to check if a tag exists in GHCR
-          check_ghcr_tag_exists() {
-            local tag="$1"
-            if docker buildx imagetools inspect "ghcr.io/${{ env.IMAGE_NAME }}:${tag}" > /dev/null 2>&1; then
-              return 0  # exists
-            else
-              return 1  # does not exist
-            fi
-          }
-          
-          # Function to filter versions using binary search optimization
-          # This finds the boundary between mirrored and non-mirrored versions
-          # and only returns versions that need to be mirrored
-          filter_versions_binary_search() {
-            local variant="$1"
-            shift
-            local versions=("$@")
-            local count=${#versions[@]}
-            
-            if [[ $count -eq 0 ]]; then
-              return
-            fi
-            
-            # If force full sync, return all versions
-            if [[ "$FORCE_FULL_SYNC" == "true" ]]; then
-              printf '%s\n' "${versions[@]}"
-              return
-            fi
-            
-            # Binary search to find the first version that needs to be mirrored
-            # Assumption: older versions are more likely to be already mirrored
-            # and newer versions are more likely to need mirroring
-            local left=0
-            local right=$((count - 1))
-            local first_missing=$count  # Index of first missing version
-            
-            while [[ $left -le $right ]]; do
-              local mid=$(( (left + right) / 2 ))
-              local version="${versions[$mid]}"
-              local tag="${variant}-${version}"
-              
-              if check_ghcr_tag_exists "$tag"; then
-                # This version exists, look for missing ones in higher versions
-                left=$((mid + 1))
-              else
-                # This version is missing, but there might be missing ones before it too
-                first_missing=$mid
-                right=$((mid - 1))
-              fi
-            done
-            
-            # Track which versions we've already output to avoid duplicates
-            declare -A seen_versions
-            
-            # Output all versions from first_missing onwards
-            for ((i = first_missing; i < count; i++)); do
-              local version="${versions[$i]}"
-              if [[ -z "${seen_versions[$version]}" ]]; then
-                echo "${version}"
-                seen_versions[$version]=1
-              fi
-            done
-            
-            # Also check a few versions before first_missing in case of gaps
-            # Check up to 5 versions before the boundary
-            local check_start=$((first_missing - 5))
-            if [[ $check_start -lt 0 ]]; then
-              check_start=0
-            fi
-            
-            for ((i = check_start; i < first_missing; i++)); do
-              local version="${versions[$i]}"
-              local tag="${variant}-${version}"
-              # Only output if not already seen and doesn't exist in GHCR
-              if [[ -z "${seen_versions[$version]}" ]] && ! check_ghcr_tag_exists "$tag"; then
-                echo "${version}"
-                seen_versions[$version]=1
-              fi
-            done
-          }
-          
-          echo "Discovering versions for each variant..."
-          
-          # Discover official versions (sharelatex/sharelatex)
-          OFFICIAL_VERSIONS=""
-          if [[ "$VARIANT_FILTER" == "all" || "$VARIANT_FILTER" == "official" ]]; then
-            echo "Fetching tags from sharelatex/sharelatex..."
-            OFFICIAL_ALL=$(get_dockerhub_tags "sharelatex/sharelatex")
-            if [[ -n "$OFFICIAL_ALL" ]]; then
-              mapfile -t OFFICIAL_ARRAY < <(echo "$OFFICIAL_ALL")
-              OFFICIAL_VERSIONS=$(filter_versions_binary_search "official" "${OFFICIAL_ARRAY[@]}" | sort -V | uniq)
-            fi
-            echo "Official versions to mirror: $(echo "$OFFICIAL_VERSIONS" | wc -l | tr -d ' ') versions"
-          fi
-          
-          # Discover full versions (tuetenk0pp/sharelatex-full)
-          FULL_VERSIONS=""
-          if [[ "$VARIANT_FILTER" == "all" || "$VARIANT_FILTER" == "full" ]]; then
-            echo "Fetching tags from tuetenk0pp/sharelatex-full..."
-            FULL_ALL=$(get_dockerhub_tags "tuetenk0pp/sharelatex-full")
-            if [[ -n "$FULL_ALL" ]]; then
-              mapfile -t FULL_ARRAY < <(echo "$FULL_ALL")
-              FULL_VERSIONS=$(filter_versions_binary_search "full" "${FULL_ARRAY[@]}" | sort -V | uniq)
-            fi
-            echo "Full versions to mirror: $(echo "$FULL_VERSIONS" | wc -l | tr -d ' ') versions"
-          fi
-          
-          # Discover CEP versions (overleafcep/sharelatex)
-          CEP_VERSIONS=""
-          if [[ "$VARIANT_FILTER" == "all" || "$VARIANT_FILTER" == "cep" ]]; then
-            echo "Fetching tags from overleafcep/sharelatex..."
-            CEP_ALL=$(get_dockerhub_tags "overleafcep/sharelatex")
-            if [[ -n "$CEP_ALL" ]]; then
-              mapfile -t CEP_ARRAY < <(echo "$CEP_ALL")
-              CEP_VERSIONS=$(filter_versions_binary_search "cep" "${CEP_ARRAY[@]}" | sort -V | uniq)
-            fi
-            echo "CEP versions to mirror: $(echo "$CEP_VERSIONS" | wc -l | tr -d ' ') versions"
-          fi
-          
-          # Convert to JSON arrays for matrix strategy
-          # Filter out empty lines and create proper JSON
-          OFFICIAL_JSON=$(echo "$OFFICIAL_VERSIONS" | grep -v '^$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          FULL_JSON=$(echo "$FULL_VERSIONS" | grep -v '^$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          CEP_JSON=$(echo "$CEP_VERSIONS" | grep -v '^$' | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          
-          # Handle empty arrays
-          [[ "$OFFICIAL_JSON" == "null" ]] && OFFICIAL_JSON="[]"
-          [[ "$FULL_JSON" == "null" ]] && FULL_JSON="[]"
-          [[ "$CEP_JSON" == "null" ]] && CEP_JSON="[]"
-          
-          {
-            echo "official_versions=${OFFICIAL_JSON}"
-            echo "full_versions=${FULL_JSON}"
-            echo "cep_versions=${CEP_JSON}"
-          } >> "$GITHUB_OUTPUT"
-          
-          echo "Discovery complete!"
-          echo "Official: $OFFICIAL_JSON"
-          echo "Full: $FULL_JSON"
-          echo "CEP: $CEP_JSON"
+          ARGS="--output-format github --image ${{ env.IMAGE_NAME }}"
+          [[ "$FORCE_FULL_SYNC" == "true" ]] && ARGS="$ARGS --force-full-sync"
+          [[ "$VARIANT_FILTER" != "all" ]] && ARGS="$ARGS --variant $VARIANT_FILTER"
+          # shellcheck disable=SC2086
+          python3 .github/scripts/mirror_images.py discover $ARGS
 
   mirror-official:
     name: Mirror Official ${{ matrix.version }}
@@ -247,6 +89,9 @@ jobs:
       matrix:
         version: ${{ fromJson(needs.discover-versions.outputs.official_versions) }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -257,42 +102,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Parse semver
-        id: semver
-        run: |
-          VERSION="${{ matrix.version }}"
-          MAJOR=$(echo "$VERSION" | cut -d. -f1)
-          MINOR=$(echo "$VERSION" | cut -d. -f2)
-          PATCH=$(echo "$VERSION" | cut -d. -f3)
-          
-          {
-            echo "version=${VERSION}"
-            echo "major=${MAJOR}"
-            echo "minor=${MINOR}"
-            echo "patch=${PATCH}"
-            echo "major_minor=${MAJOR}.${MINOR}"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Mirror image with multiple tags
         run: |
-          SOURCE="docker.io/sharelatex/sharelatex:${{ matrix.version }}"
-          DEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          
-          VERSION="${{ steps.semver.outputs.version }}"
-          MAJOR="${{ steps.semver.outputs.major }}"
-          MAJOR_MINOR="${{ steps.semver.outputs.major_minor }}"
-          
-          echo "Mirroring ${SOURCE} to ${DEST}..."
-          
-          # Create multi-tag manifest
-          # Tags: official-X.Y.Z, official-X.Y, official-X
-          docker buildx imagetools create \
-            -t "${DEST}:official-${VERSION}" \
-            -t "${DEST}:official-${MAJOR_MINOR}" \
-            -t "${DEST}:official-${MAJOR}" \
-            "${SOURCE}"
-          
-          echo "Successfully mirrored official:${VERSION}"
+          python3 .github/scripts/mirror_images.py mirror \
+            --source sharelatex/sharelatex \
+            --dest "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" \
+            --version "${{ matrix.version }}" \
+            --variant official \
+            --placeholder "${{ env.PLACEHOLDER_IMAGE }}"
 
   mirror-full:
     name: Mirror Full ${{ matrix.version }}
@@ -305,6 +122,9 @@ jobs:
       matrix:
         version: ${{ fromJson(needs.discover-versions.outputs.full_versions) }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -315,42 +135,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Parse semver
-        id: semver
-        run: |
-          VERSION="${{ matrix.version }}"
-          MAJOR=$(echo "$VERSION" | cut -d. -f1)
-          MINOR=$(echo "$VERSION" | cut -d. -f2)
-          PATCH=$(echo "$VERSION" | cut -d. -f3)
-          
-          {
-            echo "version=${VERSION}"
-            echo "major=${MAJOR}"
-            echo "minor=${MINOR}"
-            echo "patch=${PATCH}"
-            echo "major_minor=${MAJOR}.${MINOR}"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Mirror image with multiple tags
         run: |
-          SOURCE="docker.io/tuetenk0pp/sharelatex-full:${{ matrix.version }}"
-          DEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          
-          VERSION="${{ steps.semver.outputs.version }}"
-          MAJOR="${{ steps.semver.outputs.major }}"
-          MAJOR_MINOR="${{ steps.semver.outputs.major_minor }}"
-          
-          echo "Mirroring ${SOURCE} to ${DEST}..."
-          
-          # Create multi-tag manifest
-          # Tags: full-X.Y.Z, full-X.Y, full-X
-          docker buildx imagetools create \
-            -t "${DEST}:full-${VERSION}" \
-            -t "${DEST}:full-${MAJOR_MINOR}" \
-            -t "${DEST}:full-${MAJOR}" \
-            "${SOURCE}"
-          
-          echo "Successfully mirrored full:${VERSION}"
+          python3 .github/scripts/mirror_images.py mirror \
+            --source tuetenk0pp/sharelatex-full \
+            --dest "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" \
+            --version "${{ matrix.version }}" \
+            --variant full \
+            --placeholder "${{ env.PLACEHOLDER_IMAGE }}"
 
   mirror-cep:
     name: Mirror CEP ${{ matrix.version }}
@@ -363,6 +155,9 @@ jobs:
       matrix:
         version: ${{ fromJson(needs.discover-versions.outputs.cep_versions) }}
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -373,42 +168,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Parse semver
-        id: semver
-        run: |
-          VERSION="${{ matrix.version }}"
-          MAJOR=$(echo "$VERSION" | cut -d. -f1)
-          MINOR=$(echo "$VERSION" | cut -d. -f2)
-          PATCH=$(echo "$VERSION" | cut -d. -f3)
-          
-          {
-            echo "version=${VERSION}"
-            echo "major=${MAJOR}"
-            echo "minor=${MINOR}"
-            echo "patch=${PATCH}"
-            echo "major_minor=${MAJOR}.${MINOR}"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Mirror image with multiple tags
         run: |
-          SOURCE="docker.io/overleafcep/sharelatex:${{ matrix.version }}"
-          DEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          
-          VERSION="${{ steps.semver.outputs.version }}"
-          MAJOR="${{ steps.semver.outputs.major }}"
-          MAJOR_MINOR="${{ steps.semver.outputs.major_minor }}"
-          
-          echo "Mirroring ${SOURCE} to ${DEST}..."
-          
-          # Create multi-tag manifest
-          # Tags: cep-X.Y.Z, cep-X.Y, cep-X
-          docker buildx imagetools create \
-            -t "${DEST}:cep-${VERSION}" \
-            -t "${DEST}:cep-${MAJOR_MINOR}" \
-            -t "${DEST}:cep-${MAJOR}" \
-            "${SOURCE}"
-          
-          echo "Successfully mirrored cep:${VERSION}"
+          python3 .github/scripts/mirror_images.py mirror \
+            --source overleafcep/sharelatex \
+            --dest "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" \
+            --version "${{ matrix.version }}" \
+            --variant cep \
+            --placeholder "${{ env.PLACEHOLDER_IMAGE }}"
 
   update-latest-tags:
     name: Update Latest Tags
@@ -416,6 +183,9 @@ jobs:
     if: always() && (needs.mirror-official.result == 'success' || needs.mirror-full.result == 'success' || needs.mirror-cep.result == 'success' || needs.mirror-official.result == 'skipped' || needs.mirror-full.result == 'skipped' || needs.mirror-cep.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -428,59 +198,6 @@ jobs:
 
       - name: Update floating latest tags
         env:
-          OFFICIAL_VERSIONS: ${{ needs.discover-versions.outputs.official_versions }}
-          FULL_VERSIONS: ${{ needs.discover-versions.outputs.full_versions }}
-          CEP_VERSIONS: ${{ needs.discover-versions.outputs.cep_versions }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          DEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
-          
-          # Function to find the latest version tag that exists in GHCR
-          find_latest_existing_tag() {
-            local variant="$1"
-            # Get all tags from GHCR for this image using docker buildx
-            # We use imagetools inspect with multiple attempts to find the latest version
-            local tags
-            tags=$(curl -sL \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/tags/list" 2>/dev/null | jq -r '.tags[]? // empty' 2>/dev/null)
-            
-            if [[ -z "$tags" ]]; then
-              return
-            fi
-            
-            # Filter tags for this variant and find the latest semantic version
-            echo "$tags" | grep "^${variant}-[0-9]" | sed "s/^${variant}-//" | \
-              grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
-          }
-          
-          # Update official-latest tag
-          OFFICIAL_LATEST=$(find_latest_existing_tag "official")
-          if [[ -n "$OFFICIAL_LATEST" ]]; then
-            echo "Updating official-latest to point to official-${OFFICIAL_LATEST}"
-            docker buildx imagetools create \
-              -t "${DEST}:official-latest" \
-              -t "${DEST}:official" \
-              "${DEST}:official-${OFFICIAL_LATEST}" || echo "Warning: Could not update official-latest"
-          fi
-          
-          # Update full-latest tag
-          FULL_LATEST=$(find_latest_existing_tag "full")
-          if [[ -n "$FULL_LATEST" ]]; then
-            echo "Updating full-latest to point to full-${FULL_LATEST}"
-            docker buildx imagetools create \
-              -t "${DEST}:full-latest" \
-              -t "${DEST}:full" \
-              "${DEST}:full-${FULL_LATEST}" || echo "Warning: Could not update full-latest"
-          fi
-          
-          # Update cep-latest tag
-          CEP_LATEST=$(find_latest_existing_tag "cep")
-          if [[ -n "$CEP_LATEST" ]]; then
-            echo "Updating cep-latest to point to cep-${CEP_LATEST}"
-            docker buildx imagetools create \
-              -t "${DEST}:cep-latest" \
-              -t "${DEST}:cep" \
-              "${DEST}:cep-${CEP_LATEST}" || echo "Warning: Could not update cep-latest"
-          fi
-          
-          echo "Latest tags updated successfully!"
+          python3 .github/scripts/mirror_images.py update-latest --image "${{ env.IMAGE_NAME }}"
