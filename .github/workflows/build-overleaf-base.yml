@@ -1,0 +1,228 @@
+# Build overleaf-base image from upstream overleaf/overleaf
+# This workflow builds the base image which contains dependencies and TeX Live
+# Scheduled weekly to refresh dependencies, also triggered on push to main
+
+name: Build Overleaf Base Image
+
+on:
+  schedule:
+    # Weekly on Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-overleaf-base.yml'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even if image exists'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  BASE_IMAGE_NAME: btreemap/overleaf-base
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-upstream:
+    name: Detect Upstream State
+    runs-on: ubuntu-latest
+    outputs:
+      edge_sha: ${{ steps.detect.outputs.edge_sha }}
+      edge_sha_short: ${{ steps.detect.outputs.edge_sha_short }}
+      build_date: ${{ steps.detect.outputs.build_date }}
+      build_datetime: ${{ steps.detect.outputs.build_datetime }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Detect upstream edge SHA
+        id: detect
+        run: |
+          # Get the tip of main branch from upstream
+          EDGE_SHA=$(git ls-remote https://github.com/overleaf/overleaf.git refs/heads/main | cut -f1)
+          echo "edge_sha=${EDGE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "edge_sha_short=${EDGE_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          
+          # Generate build timestamps
+          BUILD_DATE=$(date -u '+%Y-%m-%d')
+          BUILD_DATETIME=$(date -u '+%Y-%m-%d.%H-%M-%S')
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          echo "build_datetime=${BUILD_DATETIME}" >> "$GITHUB_OUTPUT"
+          
+          echo "Detected upstream edge SHA: ${EDGE_SHA}"
+          echo "Build date: ${BUILD_DATE}"
+          echo "Build datetime: ${BUILD_DATETIME}"
+
+      - name: Check if image exists in GHCR
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EDGE_SHA="${{ steps.detect.outputs.edge_sha }}"
+          IMAGE_TAG="edge-sha-${EDGE_SHA}"
+          
+          # Check if this is a weekly scheduled run or forced rebuild
+          IS_SCHEDULED="${{ github.event_name == 'schedule' }}"
+          FORCE_REBUILD="${{ inputs.force_rebuild || 'false' }}"
+          
+          # For weekly builds, always rebuild
+          if [[ "$IS_SCHEDULED" == "true" ]]; then
+            echo "Weekly scheduled build - forcing rebuild"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            echo "Force rebuild requested"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Check if image already exists using GitHub API
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/btreemap/packages/container/overleaf-base/versions" 2>/dev/null || echo "000")
+          
+          if [[ "$HTTP_STATUS" == "200" ]]; then
+            # Package exists, check for specific tag using docker buildx
+            if docker buildx imagetools inspect "ghcr.io/btreemap/overleaf-base:${IMAGE_TAG}" > /dev/null 2>&1; then
+              echo "Image with tag ${IMAGE_TAG} already exists, skipping build"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "Image tag ${IMAGE_TAG} not found, will build"
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Package not found or error checking (HTTP ${HTTP_STATUS}), will build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: detect-upstream
+    if: needs.detect-upstream.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    outputs:
+      digest-amd64: ${{ steps.build.outputs.digest-amd64 }}
+      digest-arm64: ${{ steps.build.outputs.digest-arm64 }}
+    steps:
+      - name: Checkout upstream overleaf
+        uses: actions/checkout@v4
+        with:
+          repository: overleaf/overleaf
+          path: upstream
+          ref: ${{ needs.detect-upstream.outputs.edge_sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=Overleaf Base
+            org.opencontainers.image.description=Base image for Overleaf with dependencies and TeX Live
+            org.opencontainers.image.vendor=BTreeMap
+            org.opencontainers.image.source=https://github.com/overleaf/overleaf
+            org.opencontainers.image.revision=${{ needs.detect-upstream.outputs.edge_sha }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/server-ce/Dockerfile-base
+          platforms: ${{ matrix.platform }}
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=overleaf-base-edge-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=overleaf-base-edge-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+          echo "digest-${{ matrix.arch }}=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-base-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Create Multi-Arch Manifest
+    needs: [detect-upstream, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-base-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}
+          tags: |
+            # Immutable SHA tag
+            type=raw,value=edge-sha-${{ needs.detect-upstream.outputs.edge_sha }}
+            # Floating edge tag
+            type=raw,value=edge
+            # Date-based tags
+            type=raw,value=edge-${{ needs.detect-upstream.outputs.build_date }}
+            type=raw,value=edge-${{ needs.detect-upstream.outputs.build_datetime }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGESTS=$(printf '${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}@sha256:%s ' *)
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $TAGS $DIGESTS
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.BASE_IMAGE_NAME }}:edge"

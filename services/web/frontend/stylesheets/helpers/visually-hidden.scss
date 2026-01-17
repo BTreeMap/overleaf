@@ -1,5 +1,0 @@
-.visually-hidden-max-md {
-  @include media-breakpoint-down(md) {
-    @include visually-hidden;
-  }
-}

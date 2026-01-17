@@ -1,81 +1,144 @@
-<h1 align="center">
-  <br>
-  <a href="https://www.overleaf.com"><img src="doc/logo.png" alt="Overleaf" width="300"></a>
-</h1>
+# Overleaf Docker Image Builder
 
-<h4 align="center">An open-source online real-time collaborative LaTeX editor.</h4>
+This repository provides automated CI/CD pipelines to build and publish Docker images for [Overleaf Community Edition](https://github.com/overleaf/overleaf).
 
-<p align="center">
-  <a href="https://github.com/overleaf/overleaf/wiki">Wiki</a> •
-  <a href="https://www.overleaf.com/for/enterprises">Server Pro</a> •
-  <a href="#contributing">Contributing</a> •
-  <a href="https://mailchi.mp/overleaf.com/community-edition-and-server-pro">Mailing List</a> •
-  <a href="#authors">Authors</a> •
-  <a href="#license">License</a>
-</p>
+> **Note:** This repository does **not** contain any upstream Overleaf source code. All builds dynamically checkout the upstream [overleaf/overleaf](https://github.com/overleaf/overleaf) repository at build time.
 
-<img src="doc/screenshot.png" alt="A screenshot of a project being edited in Overleaf Community Edition">
-<p align="center">
-  Figure 1: A screenshot of a project being edited in Overleaf Community Edition.
-</p>
+## Published Images
 
-## Community Edition
+Images are published to GitHub Container Registry (GHCR):
 
-[Overleaf](https://www.overleaf.com) is an open-source online real-time collaborative LaTeX editor. We run a hosted version at [www.overleaf.com](https://www.overleaf.com), but you can also run your own local version, and contribute to the development of Overleaf.
+- **`ghcr.io/btreemap/overleaf-base`** - Base image with dependencies and TeX Live
+- **`ghcr.io/btreemap/overleaf`** - Full Overleaf runtime with TeX Live scheme-full
 
-> [!CAUTION]
-> Overleaf Community Edition is intended for use in environments where **all** users are trusted. Community Edition is **not** appropriate for scenarios where isolation of users is required due to Sandbox Compiles not being available. When not using Sandboxed Compiles, users have full read and write access to the `sharelatex` container resources (filesystem, network, environment variables) when running LaTeX compiles.
+## Image Tags
 
-For more information on Sandbox Compiles check out our [documentation](https://docs.overleaf.com/on-premises/configuration/overleaf-toolkit/server-pro-only-configuration/sandboxed-compiles).
+### Stable (Recommended for Production)
 
-## Enterprise
+The **stable** images track upstream [GitHub releases](https://github.com/overleaf/overleaf/releases):
 
-If you want help installing and maintaining Overleaf in your lab or workplace, we offer an officially supported version called [Overleaf Server Pro](https://www.overleaf.com/for/enterprises). It also includes more features for security (SSO with LDAP or SAML), administration and collaboration (e.g. tracked changes). [Find out more!](https://www.overleaf.com/for/enterprises)
+| Tag | Description |
+|-----|-------------|
+| `:latest` | Latest stable release (points to stable, not edge) |
+| `:X.Y.Z` | Specific version (e.g., `:5.1.2`) |
+| `:X.Y` | Minor version (e.g., `:5.1`) |
+| `:X` | Major version (e.g., `:5`) |
+| `:stable-vX.Y.Z` | Explicit stable tag (e.g., `:stable-v5.1.2`) |
+| `:stable-sha-<SHA>` | Immutable tag by upstream commit SHA |
+| `:YYYY-MM-DD` | Date of build |
+| `:YYYY-MM-DD.HH-MM-SS` | Datetime of build |
 
-## Keeping up to date
+### Edge (Development/Testing)
 
-Sign up to the [mailing list](https://mailchi.mp/overleaf.com/community-edition-and-server-pro) to get updates on Overleaf releases and development.
+The **edge** images track the upstream `main` branch:
 
-## Installation
+| Tag | Description |
+|-----|-------------|
+| `:edge` | Latest edge build from main |
+| `:edge-sha-<SHA>` | Immutable tag by upstream commit SHA |
+| `:edge-YYYY-MM-DD` | Date of edge build |
+| `:edge-YYYY-MM-DD.HH-MM-SS` | Datetime of edge build |
 
-We have detailed installation instructions in the [Overleaf Toolkit](https://github.com/overleaf/toolkit/).
+### Base Image
 
-## Upgrading
+| Tag | Description |
+|-----|-------------|
+| `:edge` | Latest base image |
+| `:edge-sha-<SHA>` | Immutable tag by upstream commit SHA |
+| `:edge-YYYY-MM-DD` | Date of base build |
 
-If you are upgrading from a previous version of Overleaf, please see the [Release Notes section on the Wiki](https://github.com/overleaf/overleaf/wiki#release-notes) for all of the versions between your current version and the version you are upgrading to.
+## Features
 
-## Overleaf Docker Image
+### Multi-Architecture Support
 
-This repo contains two dockerfiles, [`Dockerfile-base`](server-ce/Dockerfile-base), which builds the
-`sharelatex/sharelatex-base` image, and [`Dockerfile`](server-ce/Dockerfile) which builds the
-`sharelatex/sharelatex` (or "community") image.
+All images are built for:
+- `linux/amd64`
+- `linux/arm64`
 
-The Base image generally contains the basic dependencies like `wget`, plus `texlive`.
-We split this out because it's a pretty heavy set of
-dependencies, and it's nice to not have to rebuild all of that every time.
+### Full TeX Live (Air-Gapped Ready)
 
-The `sharelatex/sharelatex` image extends the base image and adds the actual Overleaf code
-and services.
+The `ghcr.io/btreemap/overleaf` runtime images include **TeX Live scheme-full** pre-installed. This means:
 
-Use `make build-base` and `make build-community` from `server-ce/` to build these images.
+- **Complete LaTeX package availability** - No need to install packages at runtime
+- **Air-gapped operation** - Works fully offline without network access to CTAN mirrors
+- **Production ready** - All common LaTeX packages are included out of the box
 
-We use the [Phusion base-image](https://github.com/phusion/baseimage-docker)
-(which is extended by our `base` image) to provide us with a VM-like container
-in which to run the Overleaf services. Baseimage uses the `runit` service
-manager to manage services, and we add our init-scripts from the `server-ce/runit`
-folder.
+The base image (`overleaf-base`) includes TeX Live scheme-basic. The full TeX Live installation is added in the runtime image build.
 
+## Build Schedule
 
-## Contributing
+| Image | Schedule | Description |
+|-------|----------|-------------|
+| `overleaf-base` | Weekly (Sunday) | Refreshes base dependencies and TeX Live |
+| `overleaf` (edge) | Daily | Builds from upstream `main` branch |
+| `overleaf` (stable) | Daily + On Release | Builds from upstream releases |
 
-Please see the [CONTRIBUTING](CONTRIBUTING.md) file for information on contributing to the development of Overleaf.
+Builds are skipped if the image for that upstream SHA already exists (to avoid redundant work).
 
-## Authors
+## Usage
 
-[The Overleaf Team](https://www.overleaf.com/about)
+### Quick Start
+
+```bash
+# Pull the latest stable image
+docker pull ghcr.io/btreemap/overleaf:latest
+
+# Or use a specific version
+docker pull ghcr.io/btreemap/overleaf:5.1.2
+
+# Run Overleaf
+docker run -d \
+  -p 80:80 \
+  -v overleaf-data:/var/lib/overleaf \
+  ghcr.io/btreemap/overleaf:latest
+```
+
+### Using Edge Images
+
+```bash
+# Pull the latest edge image (from main branch)
+docker pull ghcr.io/btreemap/overleaf:edge
+```
+
+### Docker Compose
+
+```yaml
+version: '3'
+services:
+  overleaf:
+    image: ghcr.io/btreemap/overleaf:latest
+    ports:
+      - "80:80"
+    volumes:
+      - overleaf-data:/var/lib/overleaf
+    environment:
+      OVERLEAF_APP_NAME: "My Overleaf"
+      
+volumes:
+  overleaf-data:
+```
+
+## How It Works
+
+1. **Detect Upstream State**: Workflows query upstream for the latest `main` SHA and release tag
+2. **Check GHCR**: Skip builds if images for those SHAs already exist
+3. **Checkout Upstream**: Dynamically checkout `overleaf/overleaf` at the target ref
+4. **Build Images**: Multi-arch builds using Docker Buildx with GHA cache
+5. **Publish**: Push to GHCR with appropriate tags
+
+## Upstream
+
+This project builds images from the official [Overleaf Community Edition](https://github.com/overleaf/overleaf) repository.
+
+For information about Overleaf itself:
+- [Overleaf Wiki](https://github.com/overleaf/overleaf/wiki)
+- [Overleaf Toolkit](https://github.com/overleaf/toolkit/)
+- [Overleaf Server Pro](https://www.overleaf.com/for/enterprises)
 
 ## License
 
-The code in this repository is released under the GNU AFFERO GENERAL PUBLIC LICENSE, version 3. A copy can be found in the [`LICENSE`](LICENSE) file.
+The CI/CD configuration in this repository is provided under the MIT License.
 
-Copyright (c) Overleaf, 2014-2025.
+The Docker images built by this repository contain software from [overleaf/overleaf](https://github.com/overleaf/overleaf) which is licensed under the [GNU Affero General Public License v3.0](https://github.com/overleaf/overleaf/blob/main/LICENSE).
+
+When using the built images, you must comply with the AGPL-3.0 license terms of the upstream Overleaf project.

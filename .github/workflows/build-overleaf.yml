@@ -1,0 +1,653 @@
+# Build overleaf runtime image from upstream overleaf/overleaf
+# This workflow builds the runtime image with full TeX Live scheme-full
+# Daily scheduled for both EDGE (main) and STABLE (latest release) targets
+
+name: Build Overleaf Image
+
+on:
+  schedule:
+    # Daily at 02:00 UTC (after base image weekly build)
+    - cron: '0 2 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/build-overleaf.yml'
+      - '.github/scripts/**'
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild even if image exists'
+        required: false
+        default: 'false'
+        type: boolean
+      build_target:
+        description: 'Build target (both, edge, stable)'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - edge
+          - stable
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: btreemap/overleaf
+  BASE_IMAGE_NAME: btreemap/overleaf-base
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-upstream:
+    name: Detect Upstream State
+    runs-on: ubuntu-latest
+    outputs:
+      edge_sha: ${{ steps.detect.outputs.edge_sha }}
+      edge_sha_short: ${{ steps.detect.outputs.edge_sha_short }}
+      stable_tag: ${{ steps.detect.outputs.stable_tag }}
+      stable_sha: ${{ steps.detect.outputs.stable_sha }}
+      stable_sha_short: ${{ steps.detect.outputs.stable_sha_short }}
+      build_date: ${{ steps.detect.outputs.build_date }}
+      build_datetime: ${{ steps.detect.outputs.build_datetime }}
+      should_build_edge: ${{ steps.check.outputs.should_build_edge }}
+      should_build_stable: ${{ steps.check.outputs.should_build_stable }}
+    steps:
+      - name: Detect upstream state
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the tip of main branch from upstream (EDGE)
+          EDGE_SHA=$(git ls-remote https://github.com/overleaf/overleaf.git refs/heads/main | cut -f1)
+          echo "edge_sha=${EDGE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "edge_sha_short=${EDGE_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Detected upstream edge SHA: ${EDGE_SHA}"
+          
+          # Get latest release tag from upstream (STABLE)
+          RELEASE_INFO=$(curl -sL \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/overleaf/overleaf/releases/latest")
+          
+          STABLE_TAG=$(echo "$RELEASE_INFO" | jq -r '.tag_name')
+          echo "stable_tag=${STABLE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Detected stable tag: ${STABLE_TAG}"
+          
+          # Get the SHA for the stable tag
+          STABLE_SHA=$(git ls-remote https://github.com/overleaf/overleaf.git "refs/tags/${STABLE_TAG}" | cut -f1)
+          
+          # If it's an annotated tag, we need to dereference it
+          if [ -z "$STABLE_SHA" ]; then
+            STABLE_SHA=$(git ls-remote https://github.com/overleaf/overleaf.git "refs/tags/${STABLE_TAG}^{}" | cut -f1)
+          fi
+          
+          echo "stable_sha=${STABLE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "stable_sha_short=${STABLE_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Detected stable SHA: ${STABLE_SHA}"
+          
+          # Generate build timestamps
+          BUILD_DATE=$(date -u '+%Y-%m-%d')
+          BUILD_DATETIME=$(date -u '+%Y-%m-%d.%H-%M-%S')
+          echo "build_date=${BUILD_DATE}" >> "$GITHUB_OUTPUT"
+          echo "build_datetime=${BUILD_DATETIME}" >> "$GITHUB_OUTPUT"
+          echo "Build date: ${BUILD_DATE}"
+          echo "Build datetime: ${BUILD_DATETIME}"
+
+      - name: Check if images exist in GHCR
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EDGE_SHA="${{ steps.detect.outputs.edge_sha }}"
+          STABLE_SHA="${{ steps.detect.outputs.stable_sha }}"
+          # STABLE_TAG is used in the check_image_exists call
+          
+          FORCE_REBUILD="${{ inputs.force_rebuild || 'false' }}"
+          BUILD_TARGET="${{ inputs.build_target || 'both' }}"
+          
+          check_image_exists() {
+            local tag="$1"
+            if docker buildx imagetools inspect "ghcr.io/${{ env.IMAGE_NAME }}:${tag}" > /dev/null 2>&1; then
+              return 0  # exists
+            else
+              return 1  # does not exist
+            fi
+          }
+          
+          # Determine if we should build edge
+          SHOULD_BUILD_EDGE="false"
+          if [[ "$BUILD_TARGET" == "both" || "$BUILD_TARGET" == "edge" ]]; then
+            if [[ "$FORCE_REBUILD" == "true" ]]; then
+              SHOULD_BUILD_EDGE="true"
+              echo "Force rebuild requested for edge"
+            elif ! check_image_exists "edge-sha-${EDGE_SHA}"; then
+              SHOULD_BUILD_EDGE="true"
+              echo "Edge image not found, will build"
+            else
+              echo "Edge image already exists for SHA ${EDGE_SHA}, skipping"
+            fi
+          fi
+          echo "should_build_edge=${SHOULD_BUILD_EDGE}" >> "$GITHUB_OUTPUT"
+          
+          # Determine if we should build stable
+          SHOULD_BUILD_STABLE="false"
+          if [[ "$BUILD_TARGET" == "both" || "$BUILD_TARGET" == "stable" ]]; then
+            if [[ "$FORCE_REBUILD" == "true" ]]; then
+              SHOULD_BUILD_STABLE="true"
+              echo "Force rebuild requested for stable"
+            elif ! check_image_exists "stable-sha-${STABLE_SHA}"; then
+              SHOULD_BUILD_STABLE="true"
+              echo "Stable image not found, will build"
+            else
+              echo "Stable image already exists for SHA ${STABLE_SHA}, skipping"
+            fi
+          fi
+          echo "should_build_stable=${SHOULD_BUILD_STABLE}" >> "$GITHUB_OUTPUT"
+
+  # ===========================================
+  # EDGE BUILD
+  # ===========================================
+  build-edge:
+    name: Build Edge (${{ matrix.arch }})
+    needs: detect-upstream
+    if: needs.detect-upstream.outputs.should_build_edge == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout this repo for scripts
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream overleaf
+        uses: actions/checkout@v4
+        with:
+          repository: overleaf/overleaf
+          path: upstream
+          ref: ${{ needs.detect-upstream.outputs.edge_sha }}
+
+      - name: Generate CI Dockerfile with full TeX Live
+        run: |
+          cat > upstream/Dockerfile.ci << 'EOF'
+          # CI-generated Dockerfile for full TeX Live installation
+          # Built from upstream overleaf/overleaf with scheme-full TeX Live
+          
+          ARG OVERLEAF_BASE_TAG=ghcr.io/btreemap/overleaf-base:edge
+          FROM $OVERLEAF_BASE_TAG AS base
+          
+          WORKDIR /overleaf
+          
+          # Add required source files
+          ADD server-ce/genScript.js /overleaf/genScript.js
+          ADD server-ce/services.js /overleaf/services.js
+          ADD package.json package-lock.json /overleaf/
+          ADD libraries/ /overleaf/libraries/
+          ADD services/ /overleaf/services/
+          ADD tools/migrations/ /overleaf/tools/migrations/
+          
+          # Add npm patches
+          ADD patches/ /overleaf/patches
+          
+          # Install npm dependencies and build webpack assets
+          RUN --mount=type=cache,target=/root/.cache \
+              --mount=type=cache,target=/root/.npm \
+              --mount=type=cache,target=/overleaf/services/web/node_modules/.cache,id=server-ce-webpack-cache \
+              --mount=type=tmpfs,target=/tmp true \
+          &&  node genScript install | bash \
+          &&  node genScript compile | bash
+          
+          # Copy runit service startup scripts to its location
+          ADD server-ce/runit /etc/service
+          
+          # Copy runit global settings to its location
+          ADD server-ce/config/env.sh /etc/overleaf/env.sh
+          
+          # Configure nginx
+          ADD server-ce/nginx/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+          ADD server-ce/nginx/overleaf.conf /etc/nginx/sites-enabled/overleaf.conf
+          ADD server-ce/nginx/clsi-nginx.conf /etc/nginx/sites-enabled/clsi-nginx.conf
+          
+          # Configure log rotation
+          ADD server-ce/logrotate/overleaf /etc/logrotate.d/overleaf
+          RUN chmod 644 /etc/logrotate.d/overleaf
+          
+          # Configure cron tasks
+          ADD server-ce/cron /overleaf/cron
+          ADD server-ce/config/crontab-history /etc/cron.d/crontab-history
+          RUN chmod 600 /etc/cron.d/crontab-history
+          ADD server-ce/config/crontab-deletion /etc/cron.d/crontab-deletion
+          RUN chmod 600 /etc/cron.d/crontab-deletion
+          
+          # Copy Phusion Image startup and shutdown scripts to their locations
+          COPY server-ce/init_scripts/ /etc/my_init.d/
+          COPY server-ce/init_preshutdown_scripts/ /etc/my_init.pre_shutdown.d/
+          
+          # Copy app settings files
+          COPY server-ce/config/settings.js /etc/overleaf/settings.js
+          
+          # Copy history-v1 files
+          COPY server-ce/config/production.json /overleaf/services/history-v1/config/production.json
+          COPY server-ce/config/custom-environment-variables.json /overleaf/services/history-v1/config/custom-environment-variables.json
+          
+          # Copy grunt thin wrapper
+          ADD server-ce/bin/grunt /usr/local/bin/grunt
+          RUN chmod +x /usr/local/bin/grunt
+          
+          # Copy history helper scripts
+          ADD server-ce/bin/flush-history-queues /overleaf/bin/flush-history-queues
+          RUN chmod +x /overleaf/bin/flush-history-queues
+          ADD server-ce/bin/force-history-resyncs /overleaf/bin/force-history-resyncs
+          RUN chmod +x /overleaf/bin/force-history-resyncs
+          
+          # Copy Latexmkrc
+          COPY server-ce/config/latexmkrc /usr/local/share/latexmk/LatexMk
+          
+          # ============================================
+          # FULL TEX LIVE INSTALLATION (AIR-GAPPED)
+          # ============================================
+          # Install scheme-full for complete LaTeX package availability
+          # This ensures the image works offline without needing to download packages
+          RUN tlmgr install scheme-full \
+          &&  tlmgr path add \
+          # Clean up tlmgr caches to reduce image size
+          &&  rm -rf /usr/local/texlive/*/tlpkg/backups/* \
+          &&  rm -rf /tmp/*
+          
+          # File that controls open|closed status of the site
+          ENV SITE_MAINTENANCE_FILE="/etc/overleaf/site_status"
+          RUN touch $SITE_MAINTENANCE_FILE
+          
+          # Set Environment Variables
+          ENV OVERLEAF_CONFIG=/etc/overleaf/settings.js
+          ENV WEB_API_USER="overleaf"
+          ENV ADMIN_PRIVILEGE_AVAILABLE="true"
+          ENV OVERLEAF_APP_NAME="Overleaf Community Edition"
+          ENV OPTIMISE_PDF="true"
+          
+          # Phusion Image timeouts before sending SIGKILL to processes
+          ENV KILL_PROCESS_TIMEOUT=55
+          ENV KILL_ALL_PROCESSES_TIMEOUT=55
+          ENV GRACEFUL_SHUTDOWN_DELAY_SECONDS=1
+          
+          ENV NODE_ENV="production"
+          ENV LOG_LEVEL="info"
+          
+          EXPOSE 80
+          
+          ENTRYPOINT ["/sbin/my_init"]
+          EOF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=Overleaf (Edge)
+            org.opencontainers.image.description=Overleaf Community Edition with full TeX Live - Edge build from main
+            org.opencontainers.image.vendor=BTreeMap
+            org.opencontainers.image.source=https://github.com/overleaf/overleaf
+            org.opencontainers.image.revision=${{ needs.detect-upstream.outputs.edge_sha }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile.ci
+          platforms: ${{ matrix.platform }}
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            OVERLEAF_BASE_TAG=ghcr.io/${{ env.BASE_IMAGE_NAME }}:edge
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=overleaf-edge-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=overleaf-edge-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-edge-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-edge:
+    name: Create Edge Multi-Arch Manifest
+    needs: [detect-upstream, build-edge]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-edge-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Immutable SHA tag
+            type=raw,value=edge-sha-${{ needs.detect-upstream.outputs.edge_sha }}
+            # Floating edge tags
+            type=raw,value=edge
+            type=raw,value=edge-${{ needs.detect-upstream.outputs.build_date }}
+            type=raw,value=edge-${{ needs.detect-upstream.outputs.build_datetime }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGESTS=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $TAGS $DIGESTS
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:edge"
+
+  # ===========================================
+  # STABLE BUILD
+  # ===========================================
+  build-stable:
+    name: Build Stable (${{ matrix.arch }})
+    needs: detect-upstream
+    if: needs.detect-upstream.outputs.should_build_stable == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout this repo for scripts
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream overleaf at stable tag
+        uses: actions/checkout@v4
+        with:
+          repository: overleaf/overleaf
+          path: upstream
+          ref: ${{ needs.detect-upstream.outputs.stable_tag }}
+
+      - name: Generate CI Dockerfile with full TeX Live
+        run: |
+          cat > upstream/Dockerfile.ci << 'EOF'
+          # CI-generated Dockerfile for full TeX Live installation
+          # Built from upstream overleaf/overleaf with scheme-full TeX Live
+          
+          ARG OVERLEAF_BASE_TAG=ghcr.io/btreemap/overleaf-base:edge
+          FROM $OVERLEAF_BASE_TAG AS base
+          
+          WORKDIR /overleaf
+          
+          # Add required source files
+          ADD server-ce/genScript.js /overleaf/genScript.js
+          ADD server-ce/services.js /overleaf/services.js
+          ADD package.json package-lock.json /overleaf/
+          ADD libraries/ /overleaf/libraries/
+          ADD services/ /overleaf/services/
+          ADD tools/migrations/ /overleaf/tools/migrations/
+          
+          # Add npm patches
+          ADD patches/ /overleaf/patches
+          
+          # Install npm dependencies and build webpack assets
+          RUN --mount=type=cache,target=/root/.cache \
+              --mount=type=cache,target=/root/.npm \
+              --mount=type=cache,target=/overleaf/services/web/node_modules/.cache,id=server-ce-webpack-cache \
+              --mount=type=tmpfs,target=/tmp true \
+          &&  node genScript install | bash \
+          &&  node genScript compile | bash
+          
+          # Copy runit service startup scripts to its location
+          ADD server-ce/runit /etc/service
+          
+          # Copy runit global settings to its location
+          ADD server-ce/config/env.sh /etc/overleaf/env.sh
+          
+          # Configure nginx
+          ADD server-ce/nginx/nginx.conf.template /etc/nginx/templates/nginx.conf.template
+          ADD server-ce/nginx/overleaf.conf /etc/nginx/sites-enabled/overleaf.conf
+          ADD server-ce/nginx/clsi-nginx.conf /etc/nginx/sites-enabled/clsi-nginx.conf
+          
+          # Configure log rotation
+          ADD server-ce/logrotate/overleaf /etc/logrotate.d/overleaf
+          RUN chmod 644 /etc/logrotate.d/overleaf
+          
+          # Configure cron tasks
+          ADD server-ce/cron /overleaf/cron
+          ADD server-ce/config/crontab-history /etc/cron.d/crontab-history
+          RUN chmod 600 /etc/cron.d/crontab-history
+          ADD server-ce/config/crontab-deletion /etc/cron.d/crontab-deletion
+          RUN chmod 600 /etc/cron.d/crontab-deletion
+          
+          # Copy Phusion Image startup and shutdown scripts to their locations
+          COPY server-ce/init_scripts/ /etc/my_init.d/
+          COPY server-ce/init_preshutdown_scripts/ /etc/my_init.pre_shutdown.d/
+          
+          # Copy app settings files
+          COPY server-ce/config/settings.js /etc/overleaf/settings.js
+          
+          # Copy history-v1 files
+          COPY server-ce/config/production.json /overleaf/services/history-v1/config/production.json
+          COPY server-ce/config/custom-environment-variables.json /overleaf/services/history-v1/config/custom-environment-variables.json
+          
+          # Copy grunt thin wrapper
+          ADD server-ce/bin/grunt /usr/local/bin/grunt
+          RUN chmod +x /usr/local/bin/grunt
+          
+          # Copy history helper scripts
+          ADD server-ce/bin/flush-history-queues /overleaf/bin/flush-history-queues
+          RUN chmod +x /overleaf/bin/flush-history-queues
+          ADD server-ce/bin/force-history-resyncs /overleaf/bin/force-history-resyncs
+          RUN chmod +x /overleaf/bin/force-history-resyncs
+          
+          # Copy Latexmkrc
+          COPY server-ce/config/latexmkrc /usr/local/share/latexmk/LatexMk
+          
+          # ============================================
+          # FULL TEX LIVE INSTALLATION (AIR-GAPPED)
+          # ============================================
+          # Install scheme-full for complete LaTeX package availability
+          # This ensures the image works offline without needing to download packages
+          RUN tlmgr install scheme-full \
+          &&  tlmgr path add \
+          # Clean up tlmgr caches to reduce image size
+          &&  rm -rf /usr/local/texlive/*/tlpkg/backups/* \
+          &&  rm -rf /tmp/*
+          
+          # File that controls open|closed status of the site
+          ENV SITE_MAINTENANCE_FILE="/etc/overleaf/site_status"
+          RUN touch $SITE_MAINTENANCE_FILE
+          
+          # Set Environment Variables
+          ENV OVERLEAF_CONFIG=/etc/overleaf/settings.js
+          ENV WEB_API_USER="overleaf"
+          ENV ADMIN_PRIVILEGE_AVAILABLE="true"
+          ENV OVERLEAF_APP_NAME="Overleaf Community Edition"
+          ENV OPTIMISE_PDF="true"
+          
+          # Phusion Image timeouts before sending SIGKILL to processes
+          ENV KILL_PROCESS_TIMEOUT=55
+          ENV KILL_ALL_PROCESSES_TIMEOUT=55
+          ENV GRACEFUL_SHUTDOWN_DELAY_SECONDS=1
+          
+          ENV NODE_ENV="production"
+          ENV LOG_LEVEL="info"
+          
+          EXPOSE 80
+          
+          ENTRYPOINT ["/sbin/my_init"]
+          EOF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=Overleaf (Stable)
+            org.opencontainers.image.description=Overleaf Community Edition with full TeX Live - Stable release ${{ needs.detect-upstream.outputs.stable_tag }}
+            org.opencontainers.image.vendor=BTreeMap
+            org.opencontainers.image.source=https://github.com/overleaf/overleaf
+            org.opencontainers.image.revision=${{ needs.detect-upstream.outputs.stable_sha }}
+            org.opencontainers.image.version=${{ needs.detect-upstream.outputs.stable_tag }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile.ci
+          platforms: ${{ matrix.platform }}
+          push: true
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            OVERLEAF_BASE_TAG=ghcr.io/${{ env.BASE_IMAGE_NAME }}:edge
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=overleaf-stable-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=overleaf-stable-${{ matrix.arch }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-stable-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-stable:
+    name: Create Stable Multi-Arch Manifest
+    needs: [detect-upstream, build-stable]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-stable-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Parse semver from stable tag
+        id: semver
+        run: |
+          STABLE_TAG="${{ needs.detect-upstream.outputs.stable_tag }}"
+          # Remove 'v' prefix if present
+          VERSION="${STABLE_TAG#v}"
+          
+          # Parse major.minor.patch
+          MAJOR=$(echo "$VERSION" | cut -d. -f1)
+          MINOR=$(echo "$VERSION" | cut -d. -f2)
+          PATCH=$(echo "$VERSION" | cut -d. -f3)
+          
+          {
+            echo "version=${VERSION}"
+            echo "major=${MAJOR}"
+            echo "minor=${MINOR}"
+            echo "patch=${PATCH}"
+            echo "major_minor=${MAJOR}.${MINOR}"
+          } >> "$GITHUB_OUTPUT"
+          
+          echo "Parsed version: ${VERSION} (major=${MAJOR}, minor=${MINOR}, patch=${PATCH})"
+
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Immutable SHA tags
+            type=raw,value=stable-sha-${{ needs.detect-upstream.outputs.stable_sha }}
+            type=raw,value=stable-${{ needs.detect-upstream.outputs.stable_tag }}
+            # :latest points to stable
+            type=raw,value=latest
+            # Semver tags
+            type=raw,value=${{ steps.semver.outputs.version }}
+            type=raw,value=${{ steps.semver.outputs.major_minor }}
+            type=raw,value=${{ steps.semver.outputs.major }}
+            # Date-based tags
+            type=raw,value=${{ needs.detect-upstream.outputs.build_date }}
+            type=raw,value=${{ needs.detect-upstream.outputs.build_datetime }}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          DIGESTS=$(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          # shellcheck disable=SC2086
+          docker buildx imagetools create $TAGS $DIGESTS
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"

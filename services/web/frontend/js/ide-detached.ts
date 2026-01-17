@@ -1,5 +1,0 @@
-import './utils/meta'
-import './utils/webpack-public-path'
-import './infrastructure/error-reporter'
-import './i18n'
-import './features/pdf-preview/components/pdf-preview-detached-root'
