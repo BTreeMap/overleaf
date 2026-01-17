@@ -51,6 +51,10 @@ Community Extended Pack with additional features:
 | `:cep-X.Y` | Minor version (e.g., `:cep-5.1`) |
 | `:cep-X` | Major version (e.g., `:cep-5`) |
 
+> CEP tags from Docker Hub may include extension suffixes such as
+> `5.5.4-ext-v3.2`. The mirror workflow preserves the full tag while still
+> generating major/minor tags from the base `X.Y.Z` portion.
+
 ### Edge (Development/Testing)
 
 The **edge** images are built from the upstream `main` branch with full TeX Live:
@@ -162,6 +166,31 @@ volumes:
 2. **Binary Search Optimization**: Use binary search to find which versions need mirroring
 3. **Mirror**: Use `docker buildx imagetools create` to copy images without rebuilding
 4. **Multi-Tag**: Apply multiple tags (X.Y.Z, X.Y, X) for version pinning flexibility
+
+### Base Image Builds
+
+1. **Detect Upstream**: Read the latest upstream `main` SHA and generate timestamps
+2. **Weekly Refresh**: Scheduled builds always rebuild to refresh dependencies
+3. **GHCR Check**: Push is skipped if the SHA-tagged image already exists
+4. **Multi-Arch Build**: Build `linux/amd64` and `linux/arm64` variants in parallel
+5. **Manifest Publish**: Merge digests into a multi-arch `edge` manifest
+
+### Full Image Builds
+
+1. **Select Version**: Use the mirror script to find the latest upstream release
+2. **Guard Daily Tag**: Skip if today's date tag already exists (unless forced)
+3. **Optimized Dockerfile**: Generate a single-layer image with scheme-full TeX Live
+4. **Multi-Arch Build**: Build both architectures and publish a manifest list
+5. **Tag Output**: Publish `latest`, date, and `<version>-full` tags
+
+### Mirror Script Reference
+
+The `mirror_images.py` CLI powers the mirroring workflow:
+
+- `discover`: Lists versions to mirror, using binary search to limit GHCR checks
+- `mirror`: Copies a specific version and tags it as full, minor, and major
+- `update-latest`: Updates floating `latest` tags for each variant
+- `latest`: Returns the newest upstream version tag from Docker Hub
 
 ## Upstream
 

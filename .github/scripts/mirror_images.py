@@ -3,7 +3,9 @@
 Docker image mirroring utilities.
 
 This module provides functions for discovering Docker image versions from
-upstream registries and determining which versions need to be mirrored.
+upstream registries and determining which versions need to be mirrored. It
+supports both strict semver tags (e.g., "6.0.1") and CEP tags that append an
+extension suffix (e.g., "6.0.1-ext-v3.3").
 """
 
 import argparse
@@ -15,19 +17,64 @@ import sys
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
+VERSION_PATTERN_TEXT = (
+    r'(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)'
+    r'(?:-ext-v(?P<ext_major>\d+)(?:\.(?P<ext_minor>\d+))?)?'
+)
+VERSION_PATTERN = re.compile(rf'^{VERSION_PATTERN_TEXT}$')
+
+
+def parse_version_parts(version: str) -> tuple[int, int, int, int | None, int | None]:
+    """Parse a version string into numeric components, including CEP extension versions.
+
+    Args:
+        version: Version string such as "6.0.0" or "6.0.0-ext-v3.3".
+
+    Returns:
+        Tuple of (major, minor, patch, ext_major, ext_minor). Extension values
+        are None when the version does not include the CEP suffix.
+    """
+    match = VERSION_PATTERN.match(version)
+    if not match:
+        raise ValueError(f"Unsupported version format: {version}")
+    major = int(match.group('major'))
+    minor = int(match.group('minor'))
+    patch = int(match.group('patch'))
+    ext_major = match.group('ext_major')
+    ext_minor = match.group('ext_minor')
+    return (
+        major,
+        minor,
+        patch,
+        int(ext_major) if ext_major is not None else None,
+        int(ext_minor) if ext_minor is not None else None,
+    )
+
+
+def version_sort_key(version: str) -> tuple[int, int, int, int, int]:
+    """Build a stable sort key for base and CEP variant version strings.
+
+    Missing extension values are represented with -1 so that plain semver tags
+    sort before CEP extension variants with the same base version.
+    """
+    major, minor, patch, ext_major, ext_minor = parse_version_parts(version)
+    if ext_major is None:
+        return (major, minor, patch, -1, -1)
+    return (major, minor, patch, ext_major, 0 if ext_minor is None else ext_minor)
+
 
 def get_dockerhub_tags(image: str) -> list[str]:
-    """Fetch all semver tags from Docker Hub for a given image.
-    
+    """Fetch version tags from Docker Hub for a given image.
+
     Args:
         image: Docker Hub image name (e.g., 'sharelatex/sharelatex')
-        
+
     Returns:
-        List of semver version tags sorted by version number
+        List of version tags sorted by version number. Tags may include
+        CEP-style suffixes such as "-ext-v3.3".
     """
     page = 1
     all_tags: list[str] = []
-    semver_pattern = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+$')
     
     while True:
         url = f"https://hub.docker.com/v2/repositories/{image}/tags?page={page}&page_size=100"
@@ -43,7 +90,7 @@ def get_dockerhub_tags(image: str) -> list[str]:
             
         for tag_info in results:
             tag = tag_info.get('name', '')
-            if semver_pattern.match(tag):
+            if VERSION_PATTERN.match(tag):
                 all_tags.append(tag)
                 
         if data.get('next') is None:
@@ -51,11 +98,11 @@ def get_dockerhub_tags(image: str) -> list[str]:
             
         page += 1
     
-    return sorted(set(all_tags), key=lambda v: [int(x) for x in v.split('.')])
+    return sorted(set(all_tags), key=version_sort_key)
 
 
 def check_ghcr_tag_exists(image: str, tag: str) -> bool:
-    """Check if a tag exists in GHCR."""
+    """Check if a tag exists in GHCR using Docker Buildx."""
     result = subprocess.run(
         ['docker', 'buildx', 'imagetools', 'inspect', f'ghcr.io/{image}:{tag}'],
         capture_output=True,
@@ -65,12 +112,16 @@ def check_ghcr_tag_exists(image: str, tag: str) -> bool:
 
 
 def filter_versions_binary_search(
-    versions: list[str], 
-    variant: str, 
+    versions: list[str],
+    variant: str,
     image: str,
     force_full_sync: bool = False
 ) -> list[str]:
-    """Filter versions using binary search to find those needing mirroring."""
+    """Filter versions using binary search to find those needing mirroring.
+
+    This reduces API calls by probing for the first missing tag and then
+    checking a short window of earlier versions to handle gaps.
+    """
     if not versions:
         return []
         
@@ -108,7 +159,7 @@ def filter_versions_binary_search(
             result.append(version)
             seen.add(version)
     
-    return sorted(result, key=lambda v: [int(x) for x in v.split('.')])
+    return sorted(result, key=version_sort_key)
 
 
 def discover_versions(
@@ -150,20 +201,19 @@ def mirror_image(
     placeholder: str
 ) -> bool:
     """Mirror a Docker image with schema1 fallback to placeholder.
-    
+
     Args:
         source: Source Docker Hub image (e.g., 'sharelatex/sharelatex')
         dest: Destination GHCR image (e.g., 'ghcr.io/btreemap/overleaf')
-        version: Version to mirror (e.g., '5.0.1')
+        version: Version to mirror (e.g., '5.0.1', '6.0.0-ext-v3.3')
         variant: Tag variant prefix (e.g., 'official', 'full', 'cep')
         placeholder: Placeholder image for schema1 manifests
-        
+
     Returns:
         True if successful, False otherwise
     """
-    parts = version.split('.')
-    major = parts[0]
-    major_minor = f"{parts[0]}.{parts[1]}"
+    major, minor, _, _, _ = parse_version_parts(version)
+    major_minor = f"{major}.{minor}"
     
     source_tag = f"docker.io/{source}:{version}"
     tags = [
@@ -223,17 +273,18 @@ def find_latest_ghcr_tag(image: str, variant: str, token: str) -> str | None:
     if not tags:
         return None
     
-    semver_pattern = re.compile(rf'^{variant}-([0-9]+\.[0-9]+\.[0-9]+)$')
     versions = []
     for tag in tags:
-        match = semver_pattern.match(tag)
-        if match:
-            versions.append(match.group(1))
+        if not tag.startswith(f"{variant}-"):
+            continue
+        version = tag[len(f"{variant}-"):]
+        if VERSION_PATTERN.match(version):
+            versions.append(version)
     
     if not versions:
         return None
     
-    return sorted(versions, key=lambda v: [int(x) for x in v.split('.')])[-1]
+    return sorted(versions, key=version_sort_key)[-1]
 
 
 def update_latest_tags(image: str, token: str) -> None:
