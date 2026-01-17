@@ -146,9 +146,16 @@ jobs:
               fi
             done
             
+            # Track which versions we've already output to avoid duplicates
+            declare -A seen_versions
+            
             # Output all versions from first_missing onwards
             for ((i = first_missing; i < count; i++)); do
-              echo "${versions[$i]}"
+              local version="${versions[$i]}"
+              if [[ -z "${seen_versions[$version]}" ]]; then
+                echo "${version}"
+                seen_versions[$version]=1
+              fi
             done
             
             # Also check a few versions before first_missing in case of gaps
@@ -161,8 +168,10 @@ jobs:
             for ((i = check_start; i < first_missing; i++)); do
               local version="${versions[$i]}"
               local tag="${variant}-${version}"
-              if ! check_ghcr_tag_exists "$tag"; then
+              # Only output if not already seen and doesn't exist in GHCR
+              if [[ -z "${seen_versions[$version]}" ]] && ! check_ghcr_tag_exists "$tag"; then
                 echo "${version}"
+                seen_versions[$version]=1
               fi
             done
           }
@@ -425,19 +434,14 @@ jobs:
         run: |
           DEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           
-          # Function to get the latest version from a JSON array
-          get_latest_version() {
-            local json="$1"
-            echo "$json" | jq -r 'if length > 0 then sort_by(split(".") | map(tonumber)) | last else empty end'
-          }
-          
           # Function to find the latest version tag that exists in GHCR
           find_latest_existing_tag() {
             local variant="$1"
-            # Get all tags from GHCR for this image
+            # Get all tags from GHCR for this image using docker buildx
+            # We use imagetools inspect with multiple attempts to find the latest version
             local tags
             tags=$(curl -sL \
-              -H "Authorization: Bearer $(echo ${{ secrets.GITHUB_TOKEN }} | base64 -w0)" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
               "https://ghcr.io/v2/${{ env.IMAGE_NAME }}/tags/list" 2>/dev/null | jq -r '.tags[]? // empty' 2>/dev/null)
             
             if [[ -z "$tags" ]]; then
