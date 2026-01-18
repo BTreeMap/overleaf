@@ -120,7 +120,7 @@ jobs:
             arch: arm64
     steps:
       - name: Checkout upstream overleaf
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: overleaf/overleaf
           path: upstream

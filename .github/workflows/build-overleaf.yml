@@ -109,10 +109,10 @@ jobs:
             arch: arm64
     steps:
       - name: Checkout this repo for scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Checkout upstream overleaf
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: overleaf/overleaf
           path: upstream
