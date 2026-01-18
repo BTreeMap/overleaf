@@ -78,9 +78,9 @@ The **edge** images are built from the upstream `main` branch with full TeX Live
 
 ### Multi-Architecture Support
 
-All images are built for:
+Images are built for:
 - `linux/amd64`
-- `linux/arm64`
+- `linux/arm64` (when upstream images provide arm64; workflows skip unsupported platforms to keep builds green)
 
 ### Full TeX Live (Air-Gapped Ready)
 
