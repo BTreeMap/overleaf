@@ -261,17 +261,34 @@ PY
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
+        id: download
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           path: /tmp/digests
           pattern: digests-full-*
           merge-multiple: true
 
+      - name: Check for digest files
+        id: digests
+        run: |
+          shopt -s nullglob
+          digests=(/tmp/digests/*)
+          if (( ${#digests[@]} == 0 )); then
+            echo "No digests found; skipping manifest creation."
+            echo "has_digests=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found ${#digests[@]} digest(s)."
+            echo "has_digests=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+        if: steps.digests.outputs.has_digests == 'true'
 
       - name: Login to GHCR
         uses: docker/login-action@v3
+        if: steps.digests.outputs.has_digests == 'true'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -280,6 +297,7 @@ PY
       - name: Generate Docker metadata
         id: meta
         uses: docker/metadata-action@v5
+        if: steps.digests.outputs.has_digests == 'true'
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -291,6 +309,7 @@ PY
             type=raw,value=${{ needs.detect-version.outputs.version }}-full
 
       - name: Create manifest list and push
+        if: steps.digests.outputs.has_digests == 'true'
         working-directory: /tmp/digests
         run: |
           TAGS=$(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON")
@@ -299,5 +318,6 @@ PY
           docker buildx imagetools create $TAGS $DIGESTS
 
       - name: Inspect image
+        if: steps.digests.outputs.has_digests == 'true'
         run: |
           docker buildx imagetools inspect "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
