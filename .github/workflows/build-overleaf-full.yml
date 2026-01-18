@@ -233,7 +233,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: steps.platform.outputs.should_build == 'true'
         with:
           name: digests-full-${{ matrix.arch }}
