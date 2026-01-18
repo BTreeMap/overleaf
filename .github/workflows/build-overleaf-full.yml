@@ -16,6 +16,7 @@ on:
     paths:
       - '.github/workflows/build-overleaf-full.yml'
       - '.github/scripts/mirror_images.py'
+      - '.github/scripts/check_platform_support.py'
   workflow_dispatch:
     inputs:
       force_rebuild:
@@ -167,35 +168,9 @@ jobs:
           IMAGE="docker.io/sharelatex/sharelatex:${{ needs.detect-version.outputs.version }}"
           export PLATFORM="${{ matrix.platform }}"
           if docker buildx imagetools inspect --format '{{json .}}' "$IMAGE" > /tmp/inspect.json 2> /tmp/inspect.err; then
-            SUPPORTED=$(python3 - <<'PY'
-import json
-import os
-
-platform = os.environ["PLATFORM"]
-parts = platform.split("/")
-if len(parts) != 2 or any(not part for part in parts):
-    raise SystemExit(
-        f"Unexpected platform format: {platform}. Expected format: "
-        "os/architecture (e.g., linux/amd64)"
-    )
-os_name, arch = parts
-
-with open("/tmp/inspect.json", "r", encoding="utf-8") as handle:
-    data = json.load(handle)
-
-platforms = data.get("platforms") or []
-if not platforms and isinstance(data.get("manifest"), dict):
-    manifest_platform = data["manifest"].get("platform")
-    if manifest_platform:
-        platforms = [manifest_platform]
-
-supported = any(
-    entry.get("os") == os_name and entry.get("architecture") == arch
-    for entry in platforms
-)
-print("true" if supported else "false")
-PY
-)
+            SUPPORTED=$(python3 .github/scripts/check_platform_support.py \
+              --platform "${PLATFORM}" \
+              --inspect-json /tmp/inspect.json)
           else
             echo "Unable to inspect ${IMAGE}; treating ${PLATFORM} as unsupported."
             if [ -s /tmp/inspect.err ]; then
@@ -272,7 +247,7 @@ PY
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4.1.3
         continue-on-error: true
         with:
           path: /tmp/digests
