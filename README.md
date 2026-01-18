@@ -199,6 +199,13 @@ supports a requested platform based on the JSON emitted by
 `docker buildx imagetools inspect --format '{{json .}}'`. Workflows use its
 `true`/`false` output to decide whether optional architectures should build.
 
+### Security Automation
+
+- **Dependabot** is configured to monitor GitHub Actions updates weekly so
+  workflows stay current with security fixes.
+- **Dependency Review** runs on pull requests to surface vulnerable dependency
+  introductions before merges.
+
 ## Upstream
 
 This project builds images from the official [Overleaf Community Edition](https://github.com/overleaf/overleaf) repository.
