@@ -44,18 +44,46 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 
 def extract_platforms(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract platform entries from a manifest list or single manifest."""
-    platforms = data.get("platforms") or []
-    if not platforms and isinstance(data.get("manifest"), dict):
-        manifest_platform = data["manifest"].get("platform")
-        if manifest_platform:
-            platforms = [manifest_platform]
-    if not isinstance(platforms, list):
-        return []
-    return [entry for entry in platforms if isinstance(entry, dict)]
+    """Extract platform entries from buildx imagetools inspect JSON."""
+    platforms: list[dict[str, Any]] = []
+
+    manifest = data.get("manifest")
+    if isinstance(manifest, dict):
+        # Multi-arch index: manifest.manifests[].platform
+        manifests = manifest.get("manifests")
+        if isinstance(manifests, list):
+            for m in manifests:
+                if not isinstance(m, dict):
+                    continue
+                p = m.get("platform")
+                if not isinstance(p, dict):
+                    continue
+
+                # Optional: skip provenance/attestation entries
+                ann = m.get("annotations")
+                if (
+                    isinstance(ann, dict)
+                    and ann.get("vnd.docker.reference.type") == "attestation-manifest"
+                ):
+                    continue
+
+                platforms.append(p)
+
+        # Single-manifest case: manifest.platform
+        p = manifest.get("platform")
+        if isinstance(p, dict):
+            platforms.append(p)
+
+    # Fallback: some outputs may have a top-level "platforms" list
+    if not platforms and isinstance(data.get("platforms"), list):
+        platforms = [p for p in data["platforms"] if isinstance(p, dict)]
+
+    return platforms
 
 
-def is_platform_supported(platforms: list[dict[str, Any]], os_name: str, arch: str) -> bool:
+def is_platform_supported(
+    platforms: list[dict[str, Any]], os_name: str, arch: str
+) -> bool:
     """Return True when any manifest entry matches the requested platform."""
     return any(
         entry.get("os") == os_name and entry.get("architecture") == arch
@@ -66,9 +94,7 @@ def is_platform_supported(platforms: list[dict[str, Any]], os_name: str, arch: s
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for platform support checks."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Check if a Docker manifest JSON includes the specified platform."
-        )
+        description=("Check if a Docker manifest JSON includes the specified platform.")
     )
     parser.add_argument(
         "--platform",
