@@ -16,6 +16,10 @@ Checks whether a Docker manifest list includes a specific platform.
 
 The script prints `true` or `false` to stdout for consumption by shell steps.
 
+**Workflow requirement:** each job that invokes helper scripts in this directory
+must include an `actions/checkout` step so the repository files are available on
+the runner workspace.
+
 ## `mirror_images.py`
 
 Provides CLI commands used by mirroring workflows to discover upstream tags,

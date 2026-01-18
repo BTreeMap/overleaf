@@ -199,6 +199,10 @@ supports a requested platform based on the JSON emitted by
 `docker buildx imagetools inspect --format '{{json .}}'`. Workflows use its
 `true`/`false` output to decide whether optional architectures should build.
 
+Each workflow job that invokes helper scripts must include an
+`actions/checkout` step so the `.github/scripts` directory is present on the
+runner workspace. Omitting checkout results in missing-script failures.
+
 ### Security Automation
 
 - **Dependabot** is configured to monitor GitHub Actions updates weekly so
