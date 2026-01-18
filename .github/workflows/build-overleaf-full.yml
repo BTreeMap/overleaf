@@ -104,6 +104,9 @@ jobs:
             arch: arm64
             optional: true
     steps:
+      - name: Checkout repository for scripts
+        uses: actions/checkout@v6
+
       - name: Generate optimized Dockerfile
         run: |
           cat > Dockerfile << 'DOCKERFILE'
