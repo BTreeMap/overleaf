@@ -192,6 +192,13 @@ The `mirror_images.py` CLI powers the mirroring workflow:
 - `update-latest`: Updates floating `latest` tags for each variant
 - `latest`: Returns the newest upstream version tag from Docker Hub
 
+### Platform Support Script Reference
+
+The `check_platform_support.py` helper validates whether an upstream image
+supports a requested platform based on the JSON emitted by
+`docker buildx imagetools inspect --format '{{json .}}'`. Workflows use its
+`true`/`false` output to decide whether optional architectures should build.
+
 ## Upstream
 
 This project builds images from the official [Overleaf Community Edition](https://github.com/overleaf/overleaf) repository.
