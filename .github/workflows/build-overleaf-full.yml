@@ -250,7 +250,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v7.0.0
+        uses: actions/download-artifact@v7
         continue-on-error: true
         with:
           path: /tmp/digests
