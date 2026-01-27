@@ -44,12 +44,10 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 
 def extract_platforms(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract platform entries from buildx imagetools inspect JSON."""
     platforms: list[dict[str, Any]] = []
 
-    manifest = data.get("manifest")
+    manifest = data.get("manifest") or data.get("Manifest")
     if isinstance(manifest, dict):
-        # Multi-arch index: manifest.manifests[].platform
         manifests = manifest.get("manifests")
         if isinstance(manifests, list):
             for m in manifests:
@@ -58,23 +56,41 @@ def extract_platforms(data: dict[str, Any]) -> list[dict[str, Any]]:
                 p = m.get("platform")
                 if not isinstance(p, dict):
                     continue
-
-                # Optional: skip provenance/attestation entries
                 ann = m.get("annotations")
                 if (
                     isinstance(ann, dict)
                     and ann.get("vnd.docker.reference.type") == "attestation-manifest"
                 ):
                     continue
-
+                # skip unknown/unknown entries defensively
+                if p.get("os") == "unknown" and p.get("architecture") == "unknown":
+                    continue
                 platforms.append(p)
 
-        # Single-manifest case: manifest.platform
+        # Some index formats may include manifest.platform, but many single-arch manifests do not.
         p = manifest.get("platform")
         if isinstance(p, dict):
             platforms.append(p)
 
-    # Fallback: some outputs may have a top-level "platforms" list
+    # NEW: fallback to image config for single-arch images
+    image = data.get("image") or data.get("Image")
+    if isinstance(image, dict):
+        # single-platform: {"os":"linux","architecture":"amd64",...}
+        if isinstance(image.get("os"), str) and isinstance(
+            image.get("architecture"), str
+        ):
+            platforms.append({"os": image["os"], "architecture": image["architecture"]})
+        else:
+            # multi-platform: {"linux/amd64": {...}, "linux/arm64": {...}}
+            for v in image.values():
+                if (
+                    isinstance(v, dict)
+                    and isinstance(v.get("os"), str)
+                    and isinstance(v.get("architecture"), str)
+                ):
+                    platforms.append({"os": v["os"], "architecture": v["architecture"]})
+
+    # Existing fallback
     if not platforms and isinstance(data.get("platforms"), list):
         platforms = [p for p in data["platforms"] if isinstance(p, dict)]
 
