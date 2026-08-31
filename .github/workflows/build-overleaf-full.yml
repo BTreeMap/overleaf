@@ -48,7 +48,7 @@ jobs:
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Detect latest upstream version
         id: detect
@@ -105,7 +105,7 @@ jobs:
             optional: true
     steps:
       - name: Checkout repository for scripts
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Generate optimized Dockerfile
         run: |
